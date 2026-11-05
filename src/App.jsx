@@ -1,5 +1,18 @@
 import React, { useState, useEffect } from 'react';
-import { Router, Route, Switch } from 'wouter';
+import { Router, Route, Switch, useBrowserLocation } from 'wouter';
+
+// GitHub Pages 部署在 /<repo>/ 子路径时，浏览器 location 会带上这个前缀，
+// 而路由表是按 /approval/:id 这种根路径写的，所以这里显式剥离。
+const ROUTER_BASE = (import.meta.env.BASE_URL || '/').replace(/\/$/, '');
+const useBaseLocation = () => {
+  const [location, navigate] = useBrowserLocation();
+  const stripped =
+    ROUTER_BASE && location.startsWith(ROUTER_BASE)
+      ? location.slice(ROUTER_BASE.length) || '/'
+      : location;
+  const nav = (to, opts) => navigate(ROUTER_BASE + to, opts);
+  return [stripped, nav];
+};
 import Navbar from './components/Navbar';
 import BottomNav from './components/BottomNav';
 import ConfigModal from './components/ConfigModal';
@@ -42,8 +55,7 @@ export default function App() {
 
       {/* 主体内容 */}
       <main className="flex-1 max-w-4xl w-full mx-auto px-4 py-6">
-        {/* GitHub Pages 部署在 /<repo>/ 子路径下时，wouter 需要剥离 base 前缀才能正确匹配路由 */}
-        <Router base={import.meta.env.BASE_URL.replace(/\/$/, '')}>
+        <Router hook={useBaseLocation}>
         <Switch>
           <Route path="/">
             <SquarePage onOpenConfig={() => setShowConfig(true)} />
