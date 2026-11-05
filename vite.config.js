@@ -60,6 +60,8 @@ function localAiFunction(mode) {
 
 // https://vite.dev/config/
 export default defineConfig(({ mode }) => ({
+  // GitHub Pages 子路径部署时由 CI 注入 VITE_BASE（例如 /sengsidai/），默认根路径
+  base: process.env.VITE_BASE || '/',
   plugins: [
     tailwindcss(),
     react(),

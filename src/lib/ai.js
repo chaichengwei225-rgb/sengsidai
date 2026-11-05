@@ -1,4 +1,4 @@
-import { getSupabase } from './supabase';
+import { getSupabase, getSupabaseCredentials } from './supabase';
 import { updateApproval } from './cloudStore';
 
 const COOLDOWN_SECONDS = 60;
@@ -10,7 +10,34 @@ const AI_AUTO_PREFIX = 'wallet_wait_ai_auto_';
 
 // 统一走 /api/*：线上由 netlify.toml 重定向到 Function，本地由 vite.config.js 代理。
 // 旧版按 hostname 判断并改走 /.netlify/functions/*，导致本地 dev 永远拿不到后端结果。
-const AI_ENDPOINT = '/api/ai-recommend';
+// AI 端点解析：
+//   - 配了 Supabase（GitHub Pages 等纯静态托管）→ 走 Supabase Edge Function
+//   - 否则走本站 /api/ai-recommend（Netlify Functions / Vite 本地插件）
+function resolveAiEndpoint() {
+  const { url } = getSupabaseCredentials();
+  if (url && /^https?:\/\//.test(url)) {
+    return `${url.replace(/\/+$/, '')}/functions/v1/ai-recommend`;
+  }
+  return '/api/ai-recommend';
+}
+
+// 统一请求：Supabase Edge Function 默认开启 JWT 校验，必须带 anon key
+async function callAiEndpoint(payload) {
+  const endpoint = resolveAiEndpoint();
+  const headers = { 'Content-Type': 'application/json' };
+  if (endpoint.includes('/functions/v1/')) {
+    const { key } = getSupabaseCredentials();
+    if (key) {
+      headers.Authorization = `Bearer ${key}`;
+      headers.apikey = key;
+    }
+  }
+  return fetch(endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload),
+  });
+}
 
 // 同一个审批单的并发请求去重，避免详情页 6 秒轮询把 GLM 打爆
 const inflight = new Map();
@@ -207,11 +234,7 @@ export async function fetchAiRecommendation(approval, votes = [], forceRefresh =
 
     // 3. 请求后端 AI 函数（线上经 netlify.toml redirect，本地经 vite proxy）
     try {
-      const res = await fetch(AI_ENDPOINT, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
+      const res = await callAiEndpoint(payload);
 
       if (res.ok) {
         const data = await res.json();
@@ -294,17 +317,13 @@ export async function fetchAiRecommendation(approval, votes = [], forceRefresh =
  */
 export async function testGlmConnection() {
   try {
-    const res = await fetch(AI_ENDPOINT, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        title: 'GLM 连通性测试',
-        price: 1,
-        category: '其他',
-        reason: '接口自检',
-        alternative: '',
-        custom_api_key: getCustomAiKey(),
-      }),
+    const res = await callAiEndpoint({
+      title: 'GLM 连通性测试',
+      price: 1,
+      category: '其他',
+      reason: '接口自检',
+      alternative: '',
+      custom_api_key: getCustomAiKey(),
     });
     if (!res.ok) {
       return { ok: false, source: 'local', reason: `后端返回 HTTP ${res.status}` };
