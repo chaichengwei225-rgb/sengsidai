@@ -4,6 +4,16 @@ import { updateApproval } from './cloudStore';
 const COOLDOWN_SECONDS = 60;
 const LAST_RETRY_PREFIX = 'wallet_wait_ai_retry_';
 const CUSTOM_AI_KEY_STORAGE = 'wallet_wait_custom_ai_key';
+const AI_SOURCE_PREFIX = 'wallet_wait_ai_source_';
+const AI_GLM_DONE_PREFIX = 'wallet_wait_ai_glm_done_';
+const AI_AUTO_PREFIX = 'wallet_wait_ai_auto_';
+
+// 统一走 /api/*：线上由 netlify.toml 重定向到 Function，本地由 vite.config.js 代理。
+// 旧版按 hostname 判断并改走 /.netlify/functions/*，导致本地 dev 永远拿不到后端结果。
+const AI_ENDPOINT = '/api/ai-recommend';
+
+// 同一个审批单的并发请求去重，避免详情页 6 秒轮询把 GLM 打爆
+const inflight = new Map();
 
 export function getCustomAiKey() {
   return localStorage.getItem(CUSTOM_AI_KEY_STORAGE) || '';
@@ -14,6 +24,77 @@ export function setCustomAiKey(key) {
     localStorage.setItem(CUSTOM_AI_KEY_STORAGE, key.trim());
   } else {
     localStorage.removeItem(CUSTOM_AI_KEY_STORAGE);
+  }
+  // 换了 Key 之后，本会话内已经判过「没接上」的审批单应当允许重新自动尝试
+  resetAiAutoFlag();
+}
+
+/** 读取该审批单当前展示的 AI 结果来源：'glm' | 'fallback' | 'local' | '' */
+export function getAiSource(approvalId) {
+  if (!approvalId) return '';
+  try {
+    return localStorage.getItem(`${AI_SOURCE_PREFIX}${approvalId}`) || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+function setAiSource(approvalId, source) {
+  if (!approvalId) return;
+  try {
+    localStorage.setItem(`${AI_SOURCE_PREFIX}${approvalId}`, source || '');
+  } catch (e) {
+    // 隐私模式下 localStorage 可能不可写，忽略即可
+  }
+}
+
+/** 该审批单是否已经成功拿到过一次真实 GLM 结果 */
+export function hasRealGlmResult(approvalId) {
+  if (!approvalId) return false;
+  try {
+    return localStorage.getItem(`${AI_GLM_DONE_PREFIX}${approvalId}`) === '1';
+  } catch (e) {
+    return false;
+  }
+}
+
+function markRealGlmResult(approvalId) {
+  try {
+    localStorage.setItem(`${AI_GLM_DONE_PREFIX}${approvalId}`, '1');
+  } catch (e) {
+    // ignore
+  }
+}
+
+/** 本会话是否已经自动尝试过补刷（用 sessionStorage，配好 Key 后刷新页面即可重试） */
+export function hasAutoTriedGlm(approvalId) {
+  if (hasRealGlmResult(approvalId)) return true;
+  try {
+    return sessionStorage.getItem(`${AI_AUTO_PREFIX}${approvalId}`) === '1';
+  } catch (e) {
+    return false;
+  }
+}
+
+export function markAutoTriedGlm(approvalId) {
+  try {
+    sessionStorage.setItem(`${AI_AUTO_PREFIX}${approvalId}`, '1');
+  } catch (e) {
+    // ignore
+  }
+}
+
+/** 清除所有「本次会话已自动尝试」标记，供用户重新配置 Key 后立即生效 */
+export function resetAiAutoFlag() {
+  try {
+    const keys = [];
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const k = sessionStorage.key(i);
+      if (k && k.startsWith(AI_AUTO_PREFIX)) keys.push(k);
+    }
+    keys.forEach(k => sessionStorage.removeItem(k));
+  } catch (e) {
+    // ignore
   }
 }
 
@@ -50,125 +131,195 @@ export function recordAiRetryTimestamp(approvalId) {
   }
 }
 
+function normalizeReasons(reasons) {
+  if (Array.isArray(reasons)) return reasons;
+  if (typeof reasons === 'string') {
+    try {
+      const parsed = JSON.parse(reasons);
+      return Array.isArray(parsed) ? parsed : [reasons];
+    } catch (e) {
+      return [reasons];
+    }
+  }
+  return [];
+}
+
 /**
- * 请求 AI 购买建议点评（优先请求线上服务，无缝智能保底）
+ * 请求 AI 购买建议点评（优先真实 GLM，失败无损回退规则引擎）
+ *
+ * 修复要点：旧版只要 approval.ai_verdict 有值就直接返回缓存，而 CreatePage 在发布时
+ * 用前端规则引擎把这个字段写死了 —— 结果详情页永远不请求后端，GLM 形同虚设。
+ * 现在只有「已经是真 GLM 结果」或「本会话已自动尝试过」才走缓存。
+ *
  * @param {Object} approval 审批单
  * @param {Array} votes 投票列表
- * @param {boolean} forceRefresh 是否强制重新生成
- * @returns {Promise<{ configured: boolean, verdict: 'buy'|'skip'|'think'|null, reasons: string[] }>}
+ * @param {boolean} forceRefresh 是否强制重新生成（手动「换个角度再评一次」）
+ * @returns {Promise<{ configured: boolean, source: string, verdict: 'buy'|'skip'|null, reasons: string[], fallback_reason?: string }>}
  */
 export async function fetchAiRecommendation(approval, votes = [], forceRefresh = false) {
-  if (!approval) return { configured: false, verdict: null, reasons: [] };
+  if (!approval) return { configured: false, source: 'local', verdict: null, reasons: [] };
 
-  // 1. 如果已有缓存且不要求强制重新生成，直接返回缓存结果
-  if (!forceRefresh && approval.ai_verdict && approval.ai_reasons) {
-    let reasons = approval.ai_reasons;
-    if (typeof reasons === 'string') {
-      try {
-        reasons = JSON.parse(reasons);
-      } catch (e) {
-        reasons = [reasons];
-      }
-    }
+  const cachedSource = getAiSource(approval.id);
+  const reasonsFromCache = normalizeReasons(approval.ai_reasons);
+
+  // 缓存短路：必须是真 GLM 结果、或本会话已经自动补刷过一次，才允许直接返回
+  if (!forceRefresh && approval.ai_verdict && reasonsFromCache.length &&
+      (cachedSource === 'glm' || hasAutoTriedGlm(approval.id))) {
     return {
       configured: true,
+      source: cachedSource || 'unknown',
       verdict: approval.ai_verdict,
-      reasons: Array.isArray(reasons) ? reasons : [reasons],
+      reasons: reasonsFromCache,
       generated_at: approval.ai_generated_at,
     };
   }
 
-  // 2. 统计当前投票与“已拥有”比例
-  const approveCount = votes.filter(v => v.type === 'approve').length;
-  const rejectCount = votes.filter(v => v.type === 'reject').length;
-  const spectateCount = votes.filter(v => v.type === 'spectate').length;
+  // 6 秒轮询可能并发触发，合并成同一个请求
+  if (inflight.has(approval.id)) return inflight.get(approval.id);
 
-  const totalAnsweredOwns = votes.filter(v => v.owns_item !== undefined && v.owns_item !== null).length;
-  const ownedCount = votes.filter(v => v.owns_item === true || v.owns_item === 'owned').length;
-  const ownedRatio = totalAnsweredOwns > 0 ? (ownedCount / totalAnsweredOwns) : 0;
+  const task = (async () => {
+    // 2. 统计当前投票与“已拥有”比例
+    const approveCount = votes.filter(v => v.type === 'approve').length;
+    const rejectCount = votes.filter(v => v.type === 'reject').length;
+    const spectateCount = votes.filter(v => v.type === 'spectate').length;
 
-  const payload = {
-    approval_id: approval.id,
-    title: approval.title,
-    price: approval.price,
-    category: approval.category,
-    reason: approval.reason,
-    alternative: approval.alternative,
-    creator_mbti: approval.creator_mbti || '',
-    target_mbtis: approval.target_mbtis || [],
-    approve_count: approveCount,
-    reject_count: rejectCount,
-    spectate_count: spectateCount,
-    owned_ratio: ownedRatio,
-    custom_api_key: getCustomAiKey(),
-  };
+    const totalAnsweredOwns = votes.filter(v => v.owns_item !== undefined && v.owns_item !== null).length;
+    const ownedCount = votes.filter(v => v.owns_item === true || v.owns_item === 'owned').length;
+    const ownedRatio = totalAnsweredOwns > 0 ? (ownedCount / totalAnsweredOwns) : 0;
 
-  let aiResult = null;
+    const payload = {
+      approval_id: approval.id,
+      title: approval.title,
+      price: approval.price,
+      category: approval.category,
+      reason: approval.reason,
+      alternative: approval.alternative,
+      creator_mbti: approval.creator_mbti || '',
+      target_mbtis: approval.target_mbtis || [],
+      approve_count: approveCount,
+      reject_count: rejectCount,
+      spectate_count: spectateCount,
+      owned_ratio: ownedRatio,
+      custom_api_key: getCustomAiKey(),
+    };
 
-  // 3. 尝试调用后端 AI 函数 (优先 /.netlify/functions/ai-recommend，也可降级 /api/ai-recommend)
-  try {
-    const fnUrl = window.location.hostname.includes('netlify')
-      ? '/.netlify/functions/ai-recommend'
-      : '/api/ai-recommend';
+    let aiResult = null;
 
-    const res = await fetch(fnUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-
-    if (res.ok) {
-      const data = await res.json();
-      if (data && data.verdict) {
-        aiResult = data;
-      }
-    }
-  } catch (netErr) {
-    // 忽略并继续使用前端本地引擎
-  }
-
-  // 4. 如果后端未启动或请求失败，直接启动前端智能推理引擎保底
-  if (!aiResult) {
-    aiResult = clientSmartAiEngine(payload);
-  }
-
-  // 5. 持久化缓存到云端与 Supabase，确保无论何时刷新均不丢失
-  const generatedAt = aiResult.generated_at || new Date().toISOString();
-  if (approval.id) {
+    // 3. 请求后端 AI 函数（线上经 netlify.toml redirect，本地经 vite proxy）
     try {
-      updateApproval({
-        id: approval.id,
-        ai_verdict: aiResult.verdict,
-        ai_reasons: aiResult.reasons,
-        ai_generated_at: generatedAt,
+      const res = await fetch(AI_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
       });
-    } catch (e) {
-      console.warn('Failed to sync AI verdict to cloud store:', e);
-    }
-  }
 
-  const client = getSupabase();
-  if (client && approval.id) {
-    try {
-      await client
-        .from('approvals')
-        .update({
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.verdict) {
+          aiResult = data;
+        }
+      }
+    } catch (netErr) {
+      console.warn('[ai] 后端 AI 函数不可达，使用本地规则引擎：', netErr);
+    }
+
+    // 4. 后端不可用时，前端内置引擎保底
+    if (!aiResult) {
+      aiResult = clientSmartAiEngine(payload);
+      aiResult.source = 'local';
+      aiResult.fallback_reason = '后端 AI 函数不可达（本地开发请确认 /api 代理已配置）';
+    }
+
+    const source = aiResult.source || (aiResult.configured ? 'fallback' : 'local');
+    if (source === 'glm') {
+      markRealGlmResult(approval.id);
+    } else if (!forceRefresh) {
+      markAutoTriedGlm(approval.id);
+    }
+    setAiSource(approval.id, source);
+
+    // 5. 持久化缓存：只写数据库已有的 4 个字段，不引入新列以免 Supabase update 报未知字段
+    const generatedAt = aiResult.generated_at || new Date().toISOString();
+    if (approval.id) {
+      try {
+        updateApproval({
+          id: approval.id,
           ai_verdict: aiResult.verdict,
           ai_reasons: aiResult.reasons,
           ai_generated_at: generatedAt,
-        })
-        .eq('id', approval.id);
-    } catch (dbErr) {
-      console.warn('Failed to cache AI verdict to DB:', dbErr);
+        });
+      } catch (e) {
+        console.warn('Failed to sync AI verdict to cloud store:', e);
+      }
     }
-  }
 
-  return {
-    configured: true,
-    verdict: aiResult.verdict,
-    reasons: aiResult.reasons || [],
-    generated_at: generatedAt,
-  };
+    const client = getSupabase();
+    if (client && approval.id) {
+      try {
+        await client
+          .from('approvals')
+          .update({
+            ai_verdict: aiResult.verdict,
+            ai_reasons: aiResult.reasons,
+            ai_generated_at: generatedAt,
+          })
+          .eq('id', approval.id);
+      } catch (dbErr) {
+        console.warn('Failed to cache AI verdict to DB:', dbErr);
+      }
+    }
+
+    return {
+      configured: true,
+      source,
+      model: aiResult.model || '',
+      fallback_reason: aiResult.fallback_reason || '',
+      verdict: aiResult.verdict,
+      reasons: aiResult.reasons || [],
+      generated_at: generatedAt,
+    };
+  })();
+
+  inflight.set(approval.id, task);
+  try {
+    return await task;
+  } finally {
+    inflight.delete(approval.id);
+  }
+}
+
+/**
+ * 配置弹窗用：直接打一次后端，判断 GLM 是否真的接通
+ * 不写任何审批单数据，也不读缓存。
+ */
+export async function testGlmConnection() {
+  try {
+    const res = await fetch(AI_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: 'GLM 连通性测试',
+        price: 1,
+        category: '其他',
+        reason: '接口自检',
+        alternative: '',
+        custom_api_key: getCustomAiKey(),
+      }),
+    });
+    if (!res.ok) {
+      return { ok: false, source: 'local', reason: `后端返回 HTTP ${res.status}` };
+    }
+    const data = await res.json();
+    return {
+      ok: data.source === 'glm',
+      source: data.source || 'unknown',
+      model: data.model || data.diagnostics?.model || '',
+      reason: data.fallback_reason || '',
+      diagnostics: data.diagnostics || null,
+    };
+  } catch (e) {
+    return { ok: false, source: 'local', reason: `无法连接后端：${e?.message || e}` };
+  }
 }
 
 /**
@@ -237,7 +388,9 @@ export function clientSmartAiEngine({ title, price, reason, alternative, approve
 }
 
 /**
- * 发布时立即生成初始 AI 建议，保证帖子一经发布即带 AI 判定，绝不闪烁丢失
+ * 发布时立即生成初始 AI 建议，保证帖子一经发布即带 AI 判定，绝不闪烁丢失。
+ * 注意：这里用的是本地规则引擎（离线秒出、不依赖网络），详情页首次打开时
+ * AiVerdictCard 会自动向后端补刷一次真实 GLM 结果并覆盖。
  */
 export function generateInitialAiAdvice(approval) {
   return clientSmartAiEngine({

@@ -1,11 +1,20 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Bot, RefreshCw, Sparkles, AlertTriangle, CheckCircle2, XCircle, HelpCircle } from 'lucide-react';
-import { fetchAiRecommendation, getAiRetryCooldown, recordAiRetryTimestamp } from '../lib/ai';
+import { fetchAiRecommendation, getAiRetryCooldown, recordAiRetryTimestamp, getAiSource, hasAutoTriedGlm } from '../lib/ai';
 
 export default function AiVerdictCard({ approval, votes = [], onUpdateApproval }) {
   const [loading, setLoading] = useState(false);
+  const [engineHint, setEngineHint] = useState('');
+  const [glmModel, setGlmModel] = useState('');
+
+  // 自动补刷的 effect 只按 approval.id 触发一次（防止 6 秒轮询反复打模型），
+  // 但要读到最新的 votes / approval 快照，否则 GLM prompt 里的票数会是旧值。
+  const latestRef = useRef({ approval, votes, onUpdateApproval });
+  latestRef.current = { approval, votes, onUpdateApproval };
+
   const [aiData, setAiData] = useState({
     configured: true,
+    source: getAiSource(approval?.id),
     verdict: approval?.ai_verdict || null,
     reasons: approval?.ai_reasons || [],
     message: '',
@@ -48,7 +57,8 @@ export default function AiVerdictCard({ approval, votes = [], onUpdateApproval }
         }
       }
       setAiData({
-        configured: Boolean(approval.ai_verdict) || !approval.ai_generated_at,
+        configured: true,
+        source: getAiSource(approval.id),
         verdict: approval.ai_verdict || null,
         reasons: Array.isArray(reasons) ? reasons : [reasons],
         message: '',
@@ -71,6 +81,8 @@ export default function AiVerdictCard({ approval, votes = [], onUpdateApproval }
 
     const res = await fetchAiRecommendation(approval, votes, true);
     setAiData(res);
+    setEngineHint(res.fallback_reason || '');
+    setGlmModel(res.model || '');
     setLoading(false);
 
     if (res.configured && res.verdict && onUpdateApproval) {
@@ -83,25 +95,39 @@ export default function AiVerdictCard({ approval, votes = [], onUpdateApproval }
     }
   };
 
-  // 首次如果完全没有 AI 建议（且未标记过），自动尝试轻量唤起生成
+  // 自动补刷：CreatePage 发布时写的是本地规则引擎结果，这里在详情页首次打开时
+  // 后台向 /api/ai-recommend 再取一次真实 GLM 结论并静默覆盖（不闪烁、不转圈）。
+  // 去重由 ai.js 的 sessionStorage / localStorage 标记负责，6 秒轮询不会反复打模型。
   useEffect(() => {
-    if (approval && !approval.ai_verdict && !approval.ai_generated_at && !loading) {
-      const autoGenerate = async () => {
-        setLoading(true);
-        const res = await fetchAiRecommendation(approval, votes, false);
-        setAiData(res);
-        setLoading(false);
-        if (res.configured && res.verdict && onUpdateApproval) {
-          onUpdateApproval({
-            ...approval,
-            ai_verdict: res.verdict,
-            ai_reasons: res.reasons,
-            ai_generated_at: new Date().toISOString(),
-          });
-        }
-      };
-      autoGenerate();
-    }
+    if (!approval?.id) return;
+    const needsFirstGeneration = !approval.ai_verdict && !approval.ai_generated_at;
+    const needsGlmUpgrade = !hasAutoTriedGlm(approval.id);
+    if (!needsFirstGeneration && !needsGlmUpgrade) return;
+
+    let cancelled = false;
+    const refresh = async () => {
+      // 数据可能异步到位，等一拍再取快照，避免把空票数喂给模型
+      const snapshot = latestRef.current;
+      const curApproval = snapshot.approval || approval;
+      const curVotes = snapshot.votes || votes;
+      if (needsFirstGeneration) setLoading(true);
+      const res = await fetchAiRecommendation(curApproval, curVotes, false);
+      if (cancelled) return;
+      setAiData(res);
+      setEngineHint(res.fallback_reason || '');
+      setGlmModel(res.model || '');
+      if (needsFirstGeneration) setLoading(false);
+      if (res.configured && res.verdict && snapshot.onUpdateApproval) {
+        snapshot.onUpdateApproval({
+          ...curApproval,
+          ai_verdict: res.verdict,
+          ai_reasons: res.reasons,
+          ai_generated_at: res.generated_at || new Date().toISOString(),
+        });
+      }
+    };
+    refresh();
+    return () => { cancelled = true; };
   }, [approval?.id]);
 
   // 结论视觉配置：鲜明亮明态度，明确显示投支持还是反对
@@ -170,6 +196,25 @@ export default function AiVerdictCard({ approval, votes = [], onUpdateApproval }
             </div>
           )}
         </div>
+      </div>
+
+      {/* AI 引擎来源标识：让「真 GLM」和「本地规则引擎」一眼可分 */}
+      <div className="mb-3 flex items-center gap-2 flex-wrap">
+        <span className={`inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-bold border ${
+          aiData.source === 'glm'
+            ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+            : 'bg-slate-50 text-slate-500 border-slate-200'
+        }`}>
+          {aiData.source === 'glm' ? <Sparkles className="w-3 h-3" /> : <Bot className="w-3 h-3" />}
+          {aiData.source === 'glm'
+            ? `GLM 实时推理 · ${glmModel || 'glm-4.7-flash'}`
+            : '本地规则引擎 · 尚未接入大模型'}
+        </span>
+        {engineHint && (
+          <span className="text-[10px] text-slate-400 truncate max-w-full" title={engineHint}>
+            {engineHint}
+          </span>
+        )}
       </div>
 
       {/* 主体点评内容 */}

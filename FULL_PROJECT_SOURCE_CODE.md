@@ -53,6 +53,19 @@ export default defineConfig({
     tailwindcss(),
     react(),
   ],
+  server: {
+    proxy: {
+      // 只代理 AI 推理接口，不代理 /api/sync-data：
+      // 避免本地开发时的写操作污染线上 Netlify Blob 真实数据。
+      // npm run dev 会复用已部署的线上 Function；若要调试本地 netlify/functions，
+      // 请改用 `npx netlify dev`（默认 8888 端口），并把 target 改成 http://localhost:8888。
+      '/api/ai-recommend': {
+        target: 'https://sengsidai.netlify.app',
+        changeOrigin: true,
+        secure: false,
+      },
+    },
+  },
 })
 ```
 
@@ -1679,6 +1692,16 @@ import { updateApproval } from './cloudStore';
 const COOLDOWN_SECONDS = 60;
 const LAST_RETRY_PREFIX = 'wallet_wait_ai_retry_';
 const CUSTOM_AI_KEY_STORAGE = 'wallet_wait_custom_ai_key';
+const AI_SOURCE_PREFIX = 'wallet_wait_ai_source_';
+const AI_GLM_DONE_PREFIX = 'wallet_wait_ai_glm_done_';
+const AI_AUTO_PREFIX = 'wallet_wait_ai_auto_';
+
+// 统一走 /api/*：线上由 netlify.toml 重定向到 Function，本地由 vite.config.js 代理。
+// 旧版按 hostname 判断并改走 /.netlify/functions/*，导致本地 dev 永远拿不到后端结果。
+const AI_ENDPOINT = '/api/ai-recommend';
+
+// 同一个审批单的并发请求去重，避免详情页 6 秒轮询把 GLM 打爆
+const inflight = new Map();
 
 export function getCustomAiKey() {
   return localStorage.getItem(CUSTOM_AI_KEY_STORAGE) || '';
@@ -1689,6 +1712,77 @@ export function setCustomAiKey(key) {
     localStorage.setItem(CUSTOM_AI_KEY_STORAGE, key.trim());
   } else {
     localStorage.removeItem(CUSTOM_AI_KEY_STORAGE);
+  }
+  // 换了 Key 之后，本会话内已经判过「没接上」的审批单应当允许重新自动尝试
+  resetAiAutoFlag();
+}
+
+/** 读取该审批单当前展示的 AI 结果来源：'glm' | 'fallback' | 'local' | '' */
+export function getAiSource(approvalId) {
+  if (!approvalId) return '';
+  try {
+    return localStorage.getItem(`${AI_SOURCE_PREFIX}${approvalId}`) || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+function setAiSource(approvalId, source) {
+  if (!approvalId) return;
+  try {
+    localStorage.setItem(`${AI_SOURCE_PREFIX}${approvalId}`, source || '');
+  } catch (e) {
+    // 隐私模式下 localStorage 可能不可写，忽略即可
+  }
+}
+
+/** 该审批单是否已经成功拿到过一次真实 GLM 结果 */
+export function hasRealGlmResult(approvalId) {
+  if (!approvalId) return false;
+  try {
+    return localStorage.getItem(`${AI_GLM_DONE_PREFIX}${approvalId}`) === '1';
+  } catch (e) {
+    return false;
+  }
+}
+
+function markRealGlmResult(approvalId) {
+  try {
+    localStorage.setItem(`${AI_GLM_DONE_PREFIX}${approvalId}`, '1');
+  } catch (e) {
+    // ignore
+  }
+}
+
+/** 本会话是否已经自动尝试过补刷（用 sessionStorage，配好 Key 后刷新页面即可重试） */
+export function hasAutoTriedGlm(approvalId) {
+  if (hasRealGlmResult(approvalId)) return true;
+  try {
+    return sessionStorage.getItem(`${AI_AUTO_PREFIX}${approvalId}`) === '1';
+  } catch (e) {
+    return false;
+  }
+}
+
+export function markAutoTriedGlm(approvalId) {
+  try {
+    sessionStorage.setItem(`${AI_AUTO_PREFIX}${approvalId}`, '1');
+  } catch (e) {
+    // ignore
+  }
+}
+
+/** 清除所有「本次会话已自动尝试」标记，供用户重新配置 Key 后立即生效 */
+export function resetAiAutoFlag() {
+  try {
+    const keys = [];
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const k = sessionStorage.key(i);
+      if (k && k.startsWith(AI_AUTO_PREFIX)) keys.push(k);
+    }
+    keys.forEach(k => sessionStorage.removeItem(k));
+  } catch (e) {
+    // ignore
   }
 }
 
@@ -1725,125 +1819,195 @@ export function recordAiRetryTimestamp(approvalId) {
   }
 }
 
+function normalizeReasons(reasons) {
+  if (Array.isArray(reasons)) return reasons;
+  if (typeof reasons === 'string') {
+    try {
+      const parsed = JSON.parse(reasons);
+      return Array.isArray(parsed) ? parsed : [reasons];
+    } catch (e) {
+      return [reasons];
+    }
+  }
+  return [];
+}
+
 /**
- * 请求 AI 购买建议点评（优先请求线上服务，无缝智能保底）
+ * 请求 AI 购买建议点评（优先真实 GLM，失败无损回退规则引擎）
+ *
+ * 修复要点：旧版只要 approval.ai_verdict 有值就直接返回缓存，而 CreatePage 在发布时
+ * 用前端规则引擎把这个字段写死了 —— 结果详情页永远不请求后端，GLM 形同虚设。
+ * 现在只有「已经是真 GLM 结果」或「本会话已自动尝试过」才走缓存。
+ *
  * @param {Object} approval 审批单
  * @param {Array} votes 投票列表
- * @param {boolean} forceRefresh 是否强制重新生成
- * @returns {Promise<{ configured: boolean, verdict: 'buy'|'skip'|'think'|null, reasons: string[] }>}
+ * @param {boolean} forceRefresh 是否强制重新生成（手动「换个角度再评一次」）
+ * @returns {Promise<{ configured: boolean, source: string, verdict: 'buy'|'skip'|null, reasons: string[], fallback_reason?: string }>}
  */
 export async function fetchAiRecommendation(approval, votes = [], forceRefresh = false) {
-  if (!approval) return { configured: false, verdict: null, reasons: [] };
+  if (!approval) return { configured: false, source: 'local', verdict: null, reasons: [] };
 
-  // 1. 如果已有缓存且不要求强制重新生成，直接返回缓存结果
-  if (!forceRefresh && approval.ai_verdict && approval.ai_reasons) {
-    let reasons = approval.ai_reasons;
-    if (typeof reasons === 'string') {
-      try {
-        reasons = JSON.parse(reasons);
-      } catch (e) {
-        reasons = [reasons];
-      }
-    }
+  const cachedSource = getAiSource(approval.id);
+  const reasonsFromCache = normalizeReasons(approval.ai_reasons);
+
+  // 缓存短路：必须是真 GLM 结果、或本会话已经自动补刷过一次，才允许直接返回
+  if (!forceRefresh && approval.ai_verdict && reasonsFromCache.length &&
+      (cachedSource === 'glm' || hasAutoTriedGlm(approval.id))) {
     return {
       configured: true,
+      source: cachedSource || 'unknown',
       verdict: approval.ai_verdict,
-      reasons: Array.isArray(reasons) ? reasons : [reasons],
+      reasons: reasonsFromCache,
       generated_at: approval.ai_generated_at,
     };
   }
 
-  // 2. 统计当前投票与“已拥有”比例
-  const approveCount = votes.filter(v => v.type === 'approve').length;
-  const rejectCount = votes.filter(v => v.type === 'reject').length;
-  const spectateCount = votes.filter(v => v.type === 'spectate').length;
+  // 6 秒轮询可能并发触发，合并成同一个请求
+  if (inflight.has(approval.id)) return inflight.get(approval.id);
 
-  const totalAnsweredOwns = votes.filter(v => v.owns_item !== undefined && v.owns_item !== null).length;
-  const ownedCount = votes.filter(v => v.owns_item === true || v.owns_item === 'owned').length;
-  const ownedRatio = totalAnsweredOwns > 0 ? (ownedCount / totalAnsweredOwns) : 0;
+  const task = (async () => {
+    // 2. 统计当前投票与“已拥有”比例
+    const approveCount = votes.filter(v => v.type === 'approve').length;
+    const rejectCount = votes.filter(v => v.type === 'reject').length;
+    const spectateCount = votes.filter(v => v.type === 'spectate').length;
 
-  const payload = {
-    approval_id: approval.id,
-    title: approval.title,
-    price: approval.price,
-    category: approval.category,
-    reason: approval.reason,
-    alternative: approval.alternative,
-    creator_mbti: approval.creator_mbti || '',
-    target_mbtis: approval.target_mbtis || [],
-    approve_count: approveCount,
-    reject_count: rejectCount,
-    spectate_count: spectateCount,
-    owned_ratio: ownedRatio,
-    custom_api_key: getCustomAiKey(),
-  };
+    const totalAnsweredOwns = votes.filter(v => v.owns_item !== undefined && v.owns_item !== null).length;
+    const ownedCount = votes.filter(v => v.owns_item === true || v.owns_item === 'owned').length;
+    const ownedRatio = totalAnsweredOwns > 0 ? (ownedCount / totalAnsweredOwns) : 0;
 
-  let aiResult = null;
+    const payload = {
+      approval_id: approval.id,
+      title: approval.title,
+      price: approval.price,
+      category: approval.category,
+      reason: approval.reason,
+      alternative: approval.alternative,
+      creator_mbti: approval.creator_mbti || '',
+      target_mbtis: approval.target_mbtis || [],
+      approve_count: approveCount,
+      reject_count: rejectCount,
+      spectate_count: spectateCount,
+      owned_ratio: ownedRatio,
+      custom_api_key: getCustomAiKey(),
+    };
 
-  // 3. 尝试调用后端 AI 函数 (优先 /.netlify/functions/ai-recommend，也可降级 /api/ai-recommend)
-  try {
-    const fnUrl = window.location.hostname.includes('netlify')
-      ? '/.netlify/functions/ai-recommend'
-      : '/api/ai-recommend';
+    let aiResult = null;
 
-    const res = await fetch(fnUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-
-    if (res.ok) {
-      const data = await res.json();
-      if (data && data.verdict) {
-        aiResult = data;
-      }
-    }
-  } catch (netErr) {
-    // 忽略并继续使用前端本地引擎
-  }
-
-  // 4. 如果后端未启动或请求失败，直接启动前端智能推理引擎保底
-  if (!aiResult) {
-    aiResult = clientSmartAiEngine(payload);
-  }
-
-  // 5. 持久化缓存到云端与 Supabase，确保无论何时刷新均不丢失
-  const generatedAt = aiResult.generated_at || new Date().toISOString();
-  if (approval.id) {
+    // 3. 请求后端 AI 函数（线上经 netlify.toml redirect，本地经 vite proxy）
     try {
-      updateApproval({
-        id: approval.id,
-        ai_verdict: aiResult.verdict,
-        ai_reasons: aiResult.reasons,
-        ai_generated_at: generatedAt,
+      const res = await fetch(AI_ENDPOINT, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
       });
-    } catch (e) {
-      console.warn('Failed to sync AI verdict to cloud store:', e);
-    }
-  }
 
-  const client = getSupabase();
-  if (client && approval.id) {
-    try {
-      await client
-        .from('approvals')
-        .update({
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.verdict) {
+          aiResult = data;
+        }
+      }
+    } catch (netErr) {
+      console.warn('[ai] 后端 AI 函数不可达，使用本地规则引擎：', netErr);
+    }
+
+    // 4. 后端不可用时，前端内置引擎保底
+    if (!aiResult) {
+      aiResult = clientSmartAiEngine(payload);
+      aiResult.source = 'local';
+      aiResult.fallback_reason = '后端 AI 函数不可达（本地开发请确认 /api 代理已配置）';
+    }
+
+    const source = aiResult.source || (aiResult.configured ? 'fallback' : 'local');
+    if (source === 'glm') {
+      markRealGlmResult(approval.id);
+    } else if (!forceRefresh) {
+      markAutoTriedGlm(approval.id);
+    }
+    setAiSource(approval.id, source);
+
+    // 5. 持久化缓存：只写数据库已有的 4 个字段，不引入新列以免 Supabase update 报未知字段
+    const generatedAt = aiResult.generated_at || new Date().toISOString();
+    if (approval.id) {
+      try {
+        updateApproval({
+          id: approval.id,
           ai_verdict: aiResult.verdict,
           ai_reasons: aiResult.reasons,
           ai_generated_at: generatedAt,
-        })
-        .eq('id', approval.id);
-    } catch (dbErr) {
-      console.warn('Failed to cache AI verdict to DB:', dbErr);
+        });
+      } catch (e) {
+        console.warn('Failed to sync AI verdict to cloud store:', e);
+      }
     }
-  }
 
-  return {
-    configured: true,
-    verdict: aiResult.verdict,
-    reasons: aiResult.reasons || [],
-    generated_at: generatedAt,
-  };
+    const client = getSupabase();
+    if (client && approval.id) {
+      try {
+        await client
+          .from('approvals')
+          .update({
+            ai_verdict: aiResult.verdict,
+            ai_reasons: aiResult.reasons,
+            ai_generated_at: generatedAt,
+          })
+          .eq('id', approval.id);
+      } catch (dbErr) {
+        console.warn('Failed to cache AI verdict to DB:', dbErr);
+      }
+    }
+
+    return {
+      configured: true,
+      source,
+      model: aiResult.model || '',
+      fallback_reason: aiResult.fallback_reason || '',
+      verdict: aiResult.verdict,
+      reasons: aiResult.reasons || [],
+      generated_at: generatedAt,
+    };
+  })();
+
+  inflight.set(approval.id, task);
+  try {
+    return await task;
+  } finally {
+    inflight.delete(approval.id);
+  }
+}
+
+/**
+ * 配置弹窗用：直接打一次后端，判断 GLM 是否真的接通
+ * 不写任何审批单数据，也不读缓存。
+ */
+export async function testGlmConnection() {
+  try {
+    const res = await fetch(AI_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: 'GLM 连通性测试',
+        price: 1,
+        category: '其他',
+        reason: '接口自检',
+        alternative: '',
+        custom_api_key: getCustomAiKey(),
+      }),
+    });
+    if (!res.ok) {
+      return { ok: false, source: 'local', reason: `后端返回 HTTP ${res.status}` };
+    }
+    const data = await res.json();
+    return {
+      ok: data.source === 'glm',
+      source: data.source || 'unknown',
+      model: data.model || data.diagnostics?.model || '',
+      reason: data.fallback_reason || '',
+      diagnostics: data.diagnostics || null,
+    };
+  } catch (e) {
+    return { ok: false, source: 'local', reason: `无法连接后端：${e?.message || e}` };
+  }
 }
 
 /**
@@ -1912,7 +2076,9 @@ export function clientSmartAiEngine({ title, price, reason, alternative, approve
 }
 
 /**
- * 发布时立即生成初始 AI 建议，保证帖子一经发布即带 AI 判定，绝不闪烁丢失
+ * 发布时立即生成初始 AI 建议，保证帖子一经发布即带 AI 判定，绝不闪烁丢失。
+ * 注意：这里用的是本地规则引擎（离线秒出、不依赖网络），详情页首次打开时
+ * AiVerdictCard 会自动向后端补刷一次真实 GLM 结果并覆盖。
  */
 export function generateInitialAiAdvice(approval) {
   return clientSmartAiEngine({
@@ -2364,14 +2530,23 @@ export default function ApprovalCard({ approval, votes = [], onShare, isOwner = 
 ## src/components/AiVerdictCard.jsx
 
 ```javascript
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Bot, RefreshCw, Sparkles, AlertTriangle, CheckCircle2, XCircle, HelpCircle } from 'lucide-react';
-import { fetchAiRecommendation, getAiRetryCooldown, recordAiRetryTimestamp } from '../lib/ai';
+import { fetchAiRecommendation, getAiRetryCooldown, recordAiRetryTimestamp, getAiSource, hasAutoTriedGlm } from '../lib/ai';
 
 export default function AiVerdictCard({ approval, votes = [], onUpdateApproval }) {
   const [loading, setLoading] = useState(false);
+  const [engineHint, setEngineHint] = useState('');
+  const [glmModel, setGlmModel] = useState('');
+
+  // 自动补刷的 effect 只按 approval.id 触发一次（防止 6 秒轮询反复打模型），
+  // 但要读到最新的 votes / approval 快照，否则 GLM prompt 里的票数会是旧值。
+  const latestRef = useRef({ approval, votes, onUpdateApproval });
+  latestRef.current = { approval, votes, onUpdateApproval };
+
   const [aiData, setAiData] = useState({
     configured: true,
+    source: getAiSource(approval?.id),
     verdict: approval?.ai_verdict || null,
     reasons: approval?.ai_reasons || [],
     message: '',
@@ -2414,7 +2589,8 @@ export default function AiVerdictCard({ approval, votes = [], onUpdateApproval }
         }
       }
       setAiData({
-        configured: Boolean(approval.ai_verdict) || !approval.ai_generated_at,
+        configured: true,
+        source: getAiSource(approval.id),
         verdict: approval.ai_verdict || null,
         reasons: Array.isArray(reasons) ? reasons : [reasons],
         message: '',
@@ -2437,6 +2613,8 @@ export default function AiVerdictCard({ approval, votes = [], onUpdateApproval }
 
     const res = await fetchAiRecommendation(approval, votes, true);
     setAiData(res);
+    setEngineHint(res.fallback_reason || '');
+    setGlmModel(res.model || '');
     setLoading(false);
 
     if (res.configured && res.verdict && onUpdateApproval) {
@@ -2449,25 +2627,39 @@ export default function AiVerdictCard({ approval, votes = [], onUpdateApproval }
     }
   };
 
-  // 首次如果完全没有 AI 建议（且未标记过），自动尝试轻量唤起生成
+  // 自动补刷：CreatePage 发布时写的是本地规则引擎结果，这里在详情页首次打开时
+  // 后台向 /api/ai-recommend 再取一次真实 GLM 结论并静默覆盖（不闪烁、不转圈）。
+  // 去重由 ai.js 的 sessionStorage / localStorage 标记负责，6 秒轮询不会反复打模型。
   useEffect(() => {
-    if (approval && !approval.ai_verdict && !approval.ai_generated_at && !loading) {
-      const autoGenerate = async () => {
-        setLoading(true);
-        const res = await fetchAiRecommendation(approval, votes, false);
-        setAiData(res);
-        setLoading(false);
-        if (res.configured && res.verdict && onUpdateApproval) {
-          onUpdateApproval({
-            ...approval,
-            ai_verdict: res.verdict,
-            ai_reasons: res.reasons,
-            ai_generated_at: new Date().toISOString(),
-          });
-        }
-      };
-      autoGenerate();
-    }
+    if (!approval?.id) return;
+    const needsFirstGeneration = !approval.ai_verdict && !approval.ai_generated_at;
+    const needsGlmUpgrade = !hasAutoTriedGlm(approval.id);
+    if (!needsFirstGeneration && !needsGlmUpgrade) return;
+
+    let cancelled = false;
+    const refresh = async () => {
+      // 数据可能异步到位，等一拍再取快照，避免把空票数喂给模型
+      const snapshot = latestRef.current;
+      const curApproval = snapshot.approval || approval;
+      const curVotes = snapshot.votes || votes;
+      if (needsFirstGeneration) setLoading(true);
+      const res = await fetchAiRecommendation(curApproval, curVotes, false);
+      if (cancelled) return;
+      setAiData(res);
+      setEngineHint(res.fallback_reason || '');
+      setGlmModel(res.model || '');
+      if (needsFirstGeneration) setLoading(false);
+      if (res.configured && res.verdict && snapshot.onUpdateApproval) {
+        snapshot.onUpdateApproval({
+          ...curApproval,
+          ai_verdict: res.verdict,
+          ai_reasons: res.reasons,
+          ai_generated_at: res.generated_at || new Date().toISOString(),
+        });
+      }
+    };
+    refresh();
+    return () => { cancelled = true; };
   }, [approval?.id]);
 
   // 结论视觉配置：鲜明亮明态度，明确显示投支持还是反对
@@ -2536,6 +2728,25 @@ export default function AiVerdictCard({ approval, votes = [], onUpdateApproval }
             </div>
           )}
         </div>
+      </div>
+
+      {/* AI 引擎来源标识：让「真 GLM」和「本地规则引擎」一眼可分 */}
+      <div className="mb-3 flex items-center gap-2 flex-wrap">
+        <span className={`inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-bold border ${
+          aiData.source === 'glm'
+            ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+            : 'bg-slate-50 text-slate-500 border-slate-200'
+        }`}>
+          {aiData.source === 'glm' ? <Sparkles className="w-3 h-3" /> : <Bot className="w-3 h-3" />}
+          {aiData.source === 'glm'
+            ? `GLM 实时推理 · ${glmModel || 'glm-4.7-flash'}`
+            : '本地规则引擎 · 尚未接入大模型'}
+        </span>
+        {engineHint && (
+          <span className="text-[10px] text-slate-400 truncate max-w-full" title={engineHint}>
+            {engineHint}
+          </span>
+        )}
       </div>
 
       {/* 主体点评内容 */}
@@ -3035,7 +3246,7 @@ export default function ShareGoodItemModal({ isOpen, onClose, onCreated }) {
 import React, { useState, useEffect } from 'react';
 import { X, Database, Check, Copy, ExternalLink, RefreshCw, AlertCircle, Sparkles } from 'lucide-react';
 import { getSupabaseCredentials, saveSupabaseCredentials, getSupabase } from '../lib/supabase';
-import { getCustomAiKey, setCustomAiKey } from '../lib/ai';
+import { getCustomAiKey, setCustomAiKey, testGlmConnection } from '../lib/ai';
 
 export default function ConfigModal({ onClose }) {
   const [url, setUrl] = useState('');
@@ -3043,6 +3254,8 @@ export default function ConfigModal({ onClose }) {
   const [aiKey, setAiKeyState] = useState('');
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState(null);
+  const [glmTesting, setGlmTesting] = useState(false);
+  const [glmResult, setGlmResult] = useState(null);
   const [copiedSql, setCopiedSql] = useState(false);
 
   useEffect(() => {
@@ -3086,6 +3299,20 @@ export default function ConfigModal({ onClose }) {
       setTestResult({ success: false, message: `连接异常: ${e.message}` });
     } finally {
       setTesting(false);
+    }
+  };
+
+  // 直接打一次后端 AI 函数，明确告诉用户走的是真 GLM 还是规则引擎
+  const handleTestGlm = async () => {
+    setCustomAiKey(aiKey);
+    setGlmTesting(true);
+    setGlmResult(null);
+    try {
+      setGlmResult(await testGlmConnection());
+    } catch (e) {
+      setGlmResult({ ok: false, reason: `测试异常：${e?.message || e}` });
+    } finally {
+      setGlmTesting(false);
     }
   };
 
@@ -3181,15 +3408,62 @@ export default function ConfigModal({ onClose }) {
 
           <div>
             <label className="text-xs font-medium text-slate-600 mb-1 block">
-              AI 接口密钥 (选填，已内置智能推理保底，也可填入自己的 API Key)：
+              智谱 GLM API Key（选填，仅保存在本机浏览器）：
             </label>
             <input 
               type="password" 
-              placeholder="例如 sk-xxxxxx 或各大模型开放平台密钥" 
+              placeholder="填入 bigmodel.cn 控制台的 API Key" 
               value={aiKey}
               onChange={(e) => setAiKeyState(e.target.value)}
               className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-mono text-slate-800 focus:outline-hidden focus:border-amber-400 focus:bg-white transition"
             />
+            <p className="text-[10px] text-slate-400 mt-1 leading-relaxed">
+              留空时读取 Netlify 后台的 <code className="font-mono">GLM_API_KEY</code> 环境变量；两者都没有就回退到本地规则引擎。正式上线建议只配服务端环境变量。
+            </p>
+            <div className="mt-2 flex items-center gap-2 flex-wrap">
+              <button
+                onClick={handleTestGlm}
+                disabled={glmTesting}
+                className="px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-800 font-bold text-[11px] rounded-xl transition flex items-center gap-1.5 disabled:opacity-60"
+              >
+                <Sparkles className={`w-3.5 h-3.5 ${glmTesting ? 'animate-spin' : ''}`} />
+                <span>{glmTesting ? '正在请求 GLM…' : '测试 GLM 是否接通'}</span>
+              </button>
+              <a
+                href="https://bigmodel.cn/usercenter/proj-mgmt/apikeys"
+                target="_blank"
+                rel="noreferrer"
+                className="text-[10px] text-slate-500 hover:text-slate-700 underline flex items-center gap-1"
+              >
+                获取免费 Key <ExternalLink className="w-3 h-3" />
+              </a>
+            </div>
+            {glmResult && (
+              <div className={`mt-2 p-2.5 rounded-xl border text-[11px] ${
+                glmResult.ok
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                  : 'bg-amber-50 border-amber-200 text-amber-800'
+              }`}>
+                <div className="font-bold">
+                  {glmResult.ok
+                    ? `✅ GLM 已接通（${glmResult.model || 'glm-4.7-flash'}）`
+                    : '⚠️ 当前仍在用规则引擎，GLM 未生效'}
+                </div>
+                {glmResult.reason && (
+                  <div className="mt-1 opacity-80 break-all">{glmResult.reason}</div>
+                )}
+                {glmResult.diagnostics && (
+                  <div className="mt-1 opacity-70">
+                    Key 来源：{glmResult.diagnostics.keySource} · 端点：{glmResult.diagnostics.endpointHost}
+                  </div>
+                )}
+                {!glmResult.ok && (
+                  <div className="mt-1 opacity-70">
+                    配好 Key 后刷新页面，详情页会自动补刷一次真实 AI 结论。
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
 
@@ -6875,29 +7149,143 @@ export default async (req) => {
 
 ```javascript
 // Netlify Serverless Function: ai-recommend
-// 统一 AI 建议推理端点：支持多模型 API Key，也具备无 Key 智能语义推演保底
+// 真实 GLM 大模型推理 + 无 Key / 调用失败时的规则引擎保底
+//
+// 设计要点：
+// 1. 无论走哪条路径都返回 source 字段（"glm" / "fallback"），前端能明确区分真模型与本地规则；
+// 2. configured 恒为 true 表示「AI 建议可用」，保持对旧前端的向后兼容，不要用它判断有没有接 Key；
+// 3. 所有失败原因经 safeError 脱敏后才返回，绝不回显 API Key；
+// 4. GLM 调用带 AbortController 超时，避免上游挂住拖垮 Netlify Function（也避免白烧额度）；
+// 5. API Key 只从服务端环境变量或请求体里的自定义 Key 读取，绝不能放进 VITE_ 前端变量。
 
-exports.handler = async function (event, context) {
-  const corsHeaders = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "authorization, content-type",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
+const DEFAULT_ENDPOINT = "https://open.bigmodel.cn/api/paas/v4/chat/completions";
+const DEFAULT_MODEL = "glm-4.7-flash"; // 智谱官方免费文本模型，见 docs.bigmodel.cn 模型概览
+const LLM_TIMEOUT_MS = 12000;
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+function json(statusCode, payload) {
+  return {
+    statusCode,
+    headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" },
+    body: JSON.stringify(payload),
   };
+}
 
-  if (event.httpMethod === "OPTIONS") {
-    return {
-      statusCode: 200,
-      headers: corsHeaders,
-      body: "ok",
-    };
+// 脱敏：截断 + 抹掉任何形似密钥 / Bearer 串，防止把 Key 回显到浏览器。
+// 上游（例如 401 Invalid API Key）常会把收到的 Key 原样回显，所以除了通用正则，
+// 还要拿当前实际使用的 Key 做精确替换，并覆盖「只回显前/后 8 位」的情况。
+function safeError(message, apiKey = "") {
+  let out = String(message || "").slice(0, 260);
+  const key = String(apiKey || "").trim();
+  if (key) {
+    out = out.split(key).join("***");
+    if (key.length >= 12) {
+      out = out.split(key.slice(0, 8)).join("***").split(key.slice(-8)).join("***");
+    }
   }
+  return out
+    .replace(/Bearer\s+\S+/gi, "Bearer ***")
+    .replace(/sk-[\w-]{6,}/gi, "sk-***")
+    .replace(/[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{6,}/g, "***");
+}
 
+// 模型偶尔会带 markdown 围栏或前后废话，这里只取最外层 JSON 对象
+function extractJson(text) {
+  let s = String(text || "").trim();
+  s = s.replace(/^```(?:json)?/i, "").replace(/```\s*$/i, "").trim();
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
+  if (start !== -1 && end > start) s = s.slice(start, end + 1);
+  return JSON.parse(s);
+}
+
+async function callGlm({ apiKey, endpoint, model, prompt }) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+  try {
+    const resp = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey.trim()}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        stream: false,
+        temperature: 0.7,
+        messages: [
+          {
+            role: "system",
+            content: "你是一个精打细算、反冲动消费但支持合理悦己的清醒朋友。严格输出合法 JSON 格式，不要输出任何解释性文字。",
+          },
+          { role: "user", content: prompt },
+        ],
+      }),
+      signal: controller.signal,
+    });
+
+    if (!resp.ok) {
+      let detail = "";
+      try {
+        detail = (await resp.text()).slice(0, 240);
+      } catch (e) {
+        detail = "";
+      }
+      return {
+        ok: false,
+        reason: `上游返回 HTTP ${resp.status}${detail ? "：" + safeError(detail, apiKey) : ""}`,
+      };
+    }
+
+    const raw = await resp.json();
+    const content = raw?.choices?.[0]?.message?.content || "";
+    if (!content) {
+      return { ok: false, reason: "上游响应缺少 choices[0].message.content" };
+    }
+
+    let parsed;
+    try {
+      parsed = extractJson(content);
+    } catch (e) {
+      return { ok: false, reason: `模型返回不是合法 JSON：${safeError(content, apiKey)}` };
+    }
+
+    // 站内有 think 历史数据，统一归一到 skip（AI 不弃权）
+    const verdict =
+      parsed.verdict === "buy"
+        ? "buy"
+        : parsed.verdict === "skip" || parsed.verdict === "think"
+          ? "skip"
+          : null;
+    if (!verdict) {
+      return { ok: false, reason: `模型 verdict 非法：${safeError(parsed.verdict, apiKey)}` };
+    }
+
+    const reasons = (Array.isArray(parsed.reasons) ? parsed.reasons : [parsed.reasons])
+      .filter((r) => typeof r === "string" && r.trim())
+      .map((r) => r.trim().slice(0, 120))
+      .slice(0, 3);
+    if (reasons.length < 2) {
+      return { ok: false, reason: "模型给出的理由少于 2 条" };
+    }
+
+    return { ok: true, verdict, reasons, model: raw?.model || model };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+exports.handler = async function (event) {
+  if (event.httpMethod === "OPTIONS") {
+    return { statusCode: 200, headers: corsHeaders, body: "ok" };
+  }
   if (event.httpMethod !== "POST") {
-    return {
-      statusCode: 405,
-      headers: corsHeaders,
-      body: JSON.stringify({ error: "Method Not Allowed" }),
-    };
+    return json(405, { error: "Method Not Allowed" });
   }
 
   let body = {};
@@ -6920,17 +7308,46 @@ exports.handler = async function (event, context) {
     creator_mbti = "",
   } = body;
 
-  const apiKey =
-    process.env.AI_API_KEY ||
+  // Key 优先级：智谱专用 > 通用 > 其他兼容 provider > 浏览器里用户自填的 Key
+  const envKey =
     process.env.GLM_API_KEY ||
+    process.env.AI_API_KEY ||
     process.env.DEEPSEEK_API_KEY ||
-    process.env.OPENAI_API_KEY ||
-    body.custom_api_key;
+    process.env.OPENAI_API_KEY;
+  const customKey = typeof body.custom_api_key === "string" ? body.custom_api_key : "";
+  const apiKey = envKey || customKey;
+  const keySource = envKey
+    ? process.env.GLM_API_KEY
+      ? "server:GLM_API_KEY"
+      : process.env.AI_API_KEY
+        ? "server:AI_API_KEY"
+        : "server:other"
+    : customKey
+      ? "browser:custom_api_key"
+      : "none";
 
-  // 如果配置了大模型 API Key，尝试在线请求大模型
+  const endpoint = process.env.AI_BASE_URL || DEFAULT_ENDPOINT;
+  const model = process.env.AI_MODEL || DEFAULT_MODEL;
+  let endpointHost = endpoint;
+  try {
+    endpointHost = new URL(endpoint).host;
+  } catch (e) {
+    endpointHost = "invalid-url";
+  }
+
+  const diagnostics = {
+    hasKey: Boolean(apiKey && apiKey.trim()),
+    keySource,
+    provider: endpointHost.includes("bigmodel.cn") ? "zhipu-glm" : "openai-compatible",
+    endpointHost,
+    model,
+    timeoutMs: LLM_TIMEOUT_MS,
+  };
+
+  let fallbackReason = "";
+
   if (apiKey && apiKey.trim()) {
-    try {
-      const prompt = `你是一个帮年轻人理性消费、对抗冲动剁手的“人间清醒”好朋友。
+    const prompt = `你是一个帮年轻人理性消费、对抗冲动剁手的“人间清醒”好朋友。
 请针对这笔消费审批进行把关点评：
 【商品名称】：${title || "未命名商品"}
 【预算价格】：¥${price || 0}
@@ -6956,56 +7373,32 @@ exports.handler = async function (event, context) {
 1. verdict 必须是 "buy"（支持购买，AI将投支持票）或 "skip"（反对购买，AI将投反对票）二者之一，不可为其他值！
 2. reasons 为 2 到 3 条简明精辟的理由（每条40字以内），切中要害。`;
 
-      // 默认优先请求 GLM 或 OpenAI 兼容格式
-      const endpoint = process.env.AI_BASE_URL || "https://open.bigmodel.cn/api/paas/v4/chat/completions";
-      const model = process.env.AI_MODEL || "glm-4.7-flash";
-
-      const apiResp = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${apiKey.trim()}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model,
-          messages: [
-            {
-              role: "system",
-              content: "你是一个精打细算、反冲动消费但支持合理悦己的清醒朋友。严格输出合法 JSON 格式。",
-            },
-            {
-              role: "user",
-              content: prompt,
-            },
-          ],
-          temperature: 0.7,
-        }),
-      });
-
-      if (apiResp.ok) {
-        const rawJson = await apiResp.json();
-        const content = rawJson.choices?.[0]?.message?.content || "";
-        const cleanJson = content.replace(/```json/gi, "").replace(/```/g, "").trim();
-        const parsed = JSON.parse(cleanJson);
-        if (parsed.verdict && Array.isArray(parsed.reasons)) {
-          return {
-            statusCode: 200,
-            headers: corsHeaders,
-            body: JSON.stringify({
-              configured: true,
-              verdict: parsed.verdict,
-              reasons: parsed.reasons,
-              generated_at: new Date().toISOString(),
-            }),
-          };
-        }
+    try {
+      const llm = await callGlm({ apiKey, endpoint, model, prompt });
+      if (llm.ok) {
+        return json(200, {
+          configured: true,
+          source: "glm",
+          model: llm.model,
+          verdict: llm.verdict,
+          reasons: llm.reasons,
+          generated_at: new Date().toISOString(),
+          diagnostics: { ...diagnostics, upstreamStatus: "ok" },
+        });
       }
-    } catch (llmErr) {
-      console.warn("External LLM call failed, falling back to smart heuristic engine:", llmErr);
+      fallbackReason = llm.reason;
+    } catch (e) {
+      fallbackReason =
+        e?.name === "AbortError"
+          ? `GLM 请求超时（超过 ${LLM_TIMEOUT_MS / 1000} 秒）`
+          : `GLM 调用异常：${safeError(e?.message, apiKey)}`;
     }
+    console.warn("[ai-recommend] 真实模型未生效，回落规则引擎：", fallbackReason);
+  } else {
+    fallbackReason = "未配置 GLM_API_KEY（Netlify 环境变量与站内自定义 Key 均为空）";
   }
 
-  // 智能语义推演引擎保底（无需外部 Key，永远秒级高水准响应）
+  // 规则引擎保底：永远秒级返回，保证演示不出现空白卡片
   const generated = generateSmartRecommendation({
     title,
     price: Number(price) || 0,
@@ -7019,16 +7412,15 @@ exports.handler = async function (event, context) {
     creator_mbti,
   });
 
-  return {
-    statusCode: 200,
-    headers: corsHeaders,
-    body: JSON.stringify({
-      configured: true,
-      verdict: generated.verdict,
-      reasons: generated.reasons,
-      generated_at: new Date().toISOString(),
-    }),
-  };
+  return json(200, {
+    configured: true,
+    source: "fallback",
+    verdict: generated.verdict,
+    reasons: generated.reasons,
+    generated_at: new Date().toISOString(),
+    fallback_reason: fallbackReason,
+    diagnostics: { ...diagnostics, upstreamStatus: "fallback" },
+  });
 };
 
 function generateSmartRecommendation({ title, price, category, reason, alternative, approve_count, reject_count, owned_ratio, creator_mbti }) {
@@ -7056,7 +7448,7 @@ function generateSmartRecommendation({ title, price, category, reason, alternati
     if (reject_count > approve_count) {
       reasons.push(`现场网友劝退率偏高，群众的眼睛是雪亮的，AI投反对票带头劝退！`);
     }
-  } 
+  }
   // 2. 支持放行逻辑 (buy)：明确生产力、高频刚需，且替代品不足
   else if (isUtility && (!hasAlternative || numPrice < 300)) {
     verdict = "buy";
@@ -7069,7 +7461,7 @@ function generateSmartRecommendation({ title, price, category, reason, alternati
     if (approve_count >= reject_count) {
       reasons.push(`网友多数也认为值得一试，理智放行，买完记得物尽其用别闲置！`);
     }
-  } 
+  }
   // 3. 其他非刚需场景一律投反对票（AI省思袋的核心职责就是防冲动劝退）
   else {
     verdict = "skip";
@@ -7169,4 +7561,31 @@ export default function ConfirmDeleteModal({
     </div>
   );
 }
+```
+
+---
+
+## .env.example
+
+```ini
+# Supabase 配置（从 Supabase 项目控制台 Settings -> API 获取）
+VITE_SUPABASE_URL=https://your-project-id.supabase.co
+VITE_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+
+# ------------------------------------------------------------
+# 智谱 GLM 大模型（服务端专用）
+# 配置位置：Netlify 后台 -> Site configuration -> Environment variables
+# 重要：这些变量故意不加 VITE_ 前缀！加了会被 Vite 打进前端产物，导致 Key 公开泄露。
+#      它们只在 netlify/functions/ai-recommend.js 里通过 process.env 读取。
+# 免费模型 glm-4.7-flash，Key 申请：https://bigmodel.cn/usercenter/proj-mgmt/apikeys
+GLM_API_KEY=
+
+# 可选：切换到其他 OpenAI 兼容端点 / 模型（例如 GLM Coding Plan 专属端点）
+# AI_BASE_URL=https://open.bigmodel.cn/api/paas/v4/chat/completions
+# AI_MODEL=glm-4.7-flash
+
+# 兼容别名（优先级低于 GLM_API_KEY，一般不用填）
+# AI_API_KEY=
+# DEEPSEEK_API_KEY=
+# OPENAI_API_KEY=
 ```

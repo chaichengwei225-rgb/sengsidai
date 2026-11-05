@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { X, Database, Check, Copy, ExternalLink, RefreshCw, AlertCircle, Sparkles } from 'lucide-react';
 import { getSupabaseCredentials, saveSupabaseCredentials, getSupabase } from '../lib/supabase';
-import { getCustomAiKey, setCustomAiKey } from '../lib/ai';
+import { getCustomAiKey, setCustomAiKey, testGlmConnection } from '../lib/ai';
 
 export default function ConfigModal({ onClose }) {
   const [url, setUrl] = useState('');
@@ -9,6 +9,8 @@ export default function ConfigModal({ onClose }) {
   const [aiKey, setAiKeyState] = useState('');
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState(null);
+  const [glmTesting, setGlmTesting] = useState(false);
+  const [glmResult, setGlmResult] = useState(null);
   const [copiedSql, setCopiedSql] = useState(false);
 
   useEffect(() => {
@@ -52,6 +54,20 @@ export default function ConfigModal({ onClose }) {
       setTestResult({ success: false, message: `连接异常: ${e.message}` });
     } finally {
       setTesting(false);
+    }
+  };
+
+  // 直接打一次后端 AI 函数，明确告诉用户走的是真 GLM 还是规则引擎
+  const handleTestGlm = async () => {
+    setCustomAiKey(aiKey);
+    setGlmTesting(true);
+    setGlmResult(null);
+    try {
+      setGlmResult(await testGlmConnection());
+    } catch (e) {
+      setGlmResult({ ok: false, reason: `测试异常：${e?.message || e}` });
+    } finally {
+      setGlmTesting(false);
     }
   };
 
@@ -147,15 +163,62 @@ export default function ConfigModal({ onClose }) {
 
           <div>
             <label className="text-xs font-medium text-slate-600 mb-1 block">
-              AI 接口密钥 (选填，已内置智能推理保底，也可填入自己的 API Key)：
+              智谱 GLM API Key（选填，仅保存在本机浏览器）：
             </label>
             <input 
               type="password" 
-              placeholder="例如 sk-xxxxxx 或各大模型开放平台密钥" 
+              placeholder="填入 bigmodel.cn 控制台的 API Key" 
               value={aiKey}
               onChange={(e) => setAiKeyState(e.target.value)}
               className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs font-mono text-slate-800 focus:outline-hidden focus:border-amber-400 focus:bg-white transition"
             />
+            <p className="text-[10px] text-slate-400 mt-1 leading-relaxed">
+              留空时读取 Netlify 后台的 <code className="font-mono">GLM_API_KEY</code> 环境变量；两者都没有就回退到本地规则引擎。正式上线建议只配服务端环境变量。
+            </p>
+            <div className="mt-2 flex items-center gap-2 flex-wrap">
+              <button
+                onClick={handleTestGlm}
+                disabled={glmTesting}
+                className="px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-800 font-bold text-[11px] rounded-xl transition flex items-center gap-1.5 disabled:opacity-60"
+              >
+                <Sparkles className={`w-3.5 h-3.5 ${glmTesting ? 'animate-spin' : ''}`} />
+                <span>{glmTesting ? '正在请求 GLM…' : '测试 GLM 是否接通'}</span>
+              </button>
+              <a
+                href="https://bigmodel.cn/usercenter/proj-mgmt/apikeys"
+                target="_blank"
+                rel="noreferrer"
+                className="text-[10px] text-slate-500 hover:text-slate-700 underline flex items-center gap-1"
+              >
+                获取免费 Key <ExternalLink className="w-3 h-3" />
+              </a>
+            </div>
+            {glmResult && (
+              <div className={`mt-2 p-2.5 rounded-xl border text-[11px] ${
+                glmResult.ok
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                  : 'bg-amber-50 border-amber-200 text-amber-800'
+              }`}>
+                <div className="font-bold">
+                  {glmResult.ok
+                    ? `✅ GLM 已接通（${glmResult.model || 'glm-4.7-flash'}）`
+                    : '⚠️ 当前仍在用规则引擎，GLM 未生效'}
+                </div>
+                {glmResult.reason && (
+                  <div className="mt-1 opacity-80 break-all">{glmResult.reason}</div>
+                )}
+                {glmResult.diagnostics && (
+                  <div className="mt-1 opacity-70">
+                    Key 来源：{glmResult.diagnostics.keySource} · 端点：{glmResult.diagnostics.endpointHost}
+                  </div>
+                )}
+                {!glmResult.ok && (
+                  <div className="mt-1 opacity-70">
+                    配好 Key 后刷新页面，详情页会自动补刷一次真实 AI 结论。
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
 
