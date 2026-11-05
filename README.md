@@ -104,6 +104,18 @@ npm run dev
 
 ### 本地开发
 
-`npm run dev` 会把 `/api/ai-recommend` 代理到已部署的线上 Function（**只代理这一个路径**，
-不会把 `/api/sync-data` 的写操作同步到线上数据）。若要调试本地 Function，改用 `npx netlify dev`，
-并把 `vite.config.js` 里的代理 `target` 改成 `http://localhost:8888`。
+```bash
+cp .env.example .env   # 填入 GLM_API_KEY
+npm run dev            # http://localhost:5173
+```
+
+`vite.config.js` 里的 `localAiFunction` 插件会在开发服务器内**直接挂载本地 Function**，
+从 `.env` 读取 `GLM_API_KEY`，所以一条命令就能跑真实 GLM：
+**不需要登录 Netlify CLI、不需要部署、不依赖线上后端**。改 Key 后下一次请求即生效，无需重启。
+
+> ⚠️ 本机 `netlify dev` 在未登录 Netlify 账号时会报
+> `Failed retrieving user account: Unauthorized`，因此项目改用上面的 Vite 插件方案。
+> 只有需要模拟完整生产环境时才执行 `npx netlify login` 后再跑 `netlify dev`。
+
+本地只接管 AI 推理路径，**不会**把 `/api/sync-data` 的写操作发到线上，数据仍走本机缓存，
+可以放心调试而不会污染线上真实数据。
