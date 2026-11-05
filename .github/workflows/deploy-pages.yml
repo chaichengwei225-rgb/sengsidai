@@ -35,8 +35,8 @@ jobs:
 
       - name: Build
         env:
-          # 仓库名为 <user>.github.io 时 base 为 /，否则为 /<repo>/
-          VITE_BASE: ${{ github.event.repository.name == format('{0}.github.io', github.repository_owner) && '/' || format('/{0}/', github.event.repository.name) }}
+          # GitHub Pages 项目站固定为 /<repo>/；若改用 <user>.github.io 仓库，改成 /
+          VITE_BASE: /${{ github.event.repository.name }}/
           # anon key 本身会打进前端 JS（公开信息），用 Variables 即可；也兼容 Secrets
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL || vars.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY || vars.VITE_SUPABASE_ANON_KEY }}
