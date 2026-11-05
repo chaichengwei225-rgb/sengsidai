@@ -1,32 +1,26 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Router, Route, Switch } from 'wouter';
 
-// GitHub Pages 部署在 /<repo>/ 子路径时，浏览器 location 会带上这个前缀，
-// 而路由表是按 /approval/:id 这种根路径写的。
-// 注意：wouter v3 的 <Router base> 只影响链接生成，不会剥离 useLocation 的路径，
-// 所以这里自己实现 location hook 显式做剥离。
-const ROUTER_BASE = (import.meta.env.BASE_URL || '/').replace(/\/$/, '');
-const useBaseLocation = () => {
-  const [path, setPath] = useState(() =>
-    typeof window === 'undefined' ? '/' : window.location.pathname
-  );
+// GitHub Pages 这类纯静态托管没有服务端 rewrite，用 History 路由时深链接刷新必然 404。
+// 这里改用 hash 路由（#/approvals/xxx）：刷新、分享、直接粘贴都不会丢页面，
+// 也不需要 404.html 兜底。代价只是 URL 里多一个 #。
+const readHash = () =>
+  typeof window === 'undefined' ? '/' : window.location.hash.replace(/^#/, '') || '/';
+
+const useHashLocation = () => {
+  const [path, setPath] = useState(readHash);
   useEffect(() => {
-    const onPop = () => setPath(window.location.pathname);
-    window.addEventListener('popstate', onPop);
-    return () => window.removeEventListener('popstate', onPop);
+    const onHash = () => setPath(readHash());
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
   }, []);
   const navigate = useCallback((to, opts = {}) => {
-    const full = ROUTER_BASE + to;
-    if (opts.replace) window.history.replaceState(null, '', full);
-    else window.history.pushState(null, '', full);
-    setPath(window.location.pathname);
+    if (opts.replace) window.history.replaceState(null, '', '#' + to);
+    else window.location.hash = to;
+    setPath(to);
     window.scrollTo(0, 0);
   }, []);
-  const stripped =
-    ROUTER_BASE && path.startsWith(ROUTER_BASE)
-      ? path.slice(ROUTER_BASE.length) || '/'
-      : path;
-  return [stripped, navigate];
+  return [path, navigate];
 };
 import Navbar from './components/Navbar';
 import BottomNav from './components/BottomNav';
@@ -70,7 +64,7 @@ export default function App() {
 
       {/* 主体内容 */}
       <main className="flex-1 max-w-4xl w-full mx-auto px-4 py-6">
-        <Router hook={useBaseLocation}>
+        <Router hook={useHashLocation}>
         <Switch>
           <Route path="/">
             <SquarePage onOpenConfig={() => setShowConfig(true)} />
