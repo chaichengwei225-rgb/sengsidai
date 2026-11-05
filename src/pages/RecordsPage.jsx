@@ -7,7 +7,8 @@ import { getCurrentUser } from '../lib/user';
 import { getSupabase } from '../lib/supabase';
 import { ROAST_MESSAGES } from '../lib/constants';
 import { autoSettleApproval } from '../lib/settle';
-import { syncFromCloud, getCachedApprovals, getCachedVotes } from '../lib/cloudStore';
+import { syncFromCloud, getCachedApprovals, getCachedVotes, deleteApproval } from '../lib/cloudStore';
+import ConfirmDeleteModal from '../components/ConfirmDeleteModal';
 
 export default function RecordsPage() {
   const [currentUser] = useState(() => getCurrentUser());
@@ -19,6 +20,22 @@ export default function RecordsPage() {
   const [loading, setLoading] = useState(false);
   const [statusFilter, setStatusFilter] = useState('all'); // 'all' | 'rejected' | 'approved' | 'pending'
   const [sharingApproval, setSharingApproval] = useState(null);
+  const [pendingDelete, setPendingDelete] = useState(null);
+  const [deleting, setDeleting] = useState(false);
+
+  // 删除本人发布的审批单（二次确认后执行）
+  const handleConfirmDelete = async () => {
+    if (!pendingDelete || deleting) return;
+    setDeleting(true);
+    const res = await deleteApproval(pendingDelete.id, currentUser.id);
+    setDeleting(false);
+    setPendingDelete(null);
+    if (!res.success) {
+      window.alert(res.error);
+    } else if (!res.cloudSynced) {
+      window.alert(res.warning || '已从本机删除，但云端同步暂时失败，其他设备可能仍能看到，请稍后重试。');
+    }
+  };
 
   // 获取属于当前用户的审批与战报
   const fetchRecords = async (isManual = false) => {
@@ -258,6 +275,7 @@ export default function RecordsPage() {
               votes={votes.filter(v => v.approval_id === app.id)}
               onShare={(a) => setSharingApproval(a)}
               isOwner={true}
+              onDelete={(a) => setPendingDelete(a)}
             />
           ))}
         </div>
@@ -268,6 +286,18 @@ export default function RecordsPage() {
         <ShareModal 
           approval={sharingApproval} 
           onClose={() => setSharingApproval(null)} 
+        />
+      )}
+
+      {/* 删除确认 */}
+      {pendingDelete && (
+        <ConfirmDeleteModal
+          title="删除这条消费审批？"
+          message="删除后将立即从你和所有人的页面消失，关联的投票与讨论也会一并清除，且无法恢复。"
+          detail={pendingDelete.title || ''}
+          loading={deleting}
+          onConfirm={handleConfirmDelete}
+          onCancel={() => setPendingDelete(null)}
         />
       )}
     </div>

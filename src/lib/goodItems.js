@@ -1,7 +1,8 @@
 import { 
   syncFromCloud, 
   getCachedGoodItems, 
-  createGoodItem as createCloudGoodItem 
+  createGoodItem as createCloudGoodItem,
+  deleteGoodItem as deleteCloudGoodItem
 } from './cloudStore';
 import { INITIAL_GOOD_ITEMS } from './goodItemsFallback';
 
@@ -39,4 +40,11 @@ export async function createGoodItem(item) {
     console.warn('[GoodItems] create failed:', e);
     return { success: true, data: item };
   }
+}
+
+/**
+ * 删除本人发布的好物分享（全网同步）
+ */
+export async function removeGoodItem(itemId, userId) {
+  return deleteCloudGoodItem(itemId, userId);
 }

@@ -1,7 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { Sparkles, Plus, Image as ImageIcon, Search, Tag, User, Clock, Heart } from 'lucide-react';
+import { Sparkles, Plus, Image as ImageIcon, Search, Tag, User, Clock, Heart, Trash2 } from 'lucide-react';
 import ShareGoodItemModal from '../components/ShareGoodItemModal';
-import { fetchGoodItems, getLocalGoodItems } from '../lib/goodItems';
+import { fetchGoodItems, getLocalGoodItems, removeGoodItem } from '../lib/goodItems';
+import { getCurrentUser } from '../lib/user';
+import ConfirmDeleteModal from '../components/ConfirmDeleteModal';
 
 // 好物卡片图片组件（固定比例，真实图片优先，样式统一）
 function GoodItemImage({ src, alt }) {
@@ -45,6 +47,27 @@ export default function GoodItemsPage() {
   const [loading, setLoading] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
+  const [currentUser] = useState(() => getCurrentUser());
+  const [pendingDelete, setPendingDelete] = useState(null);
+  const [deleting, setDeleting] = useState(false);
+
+  // 删除本人发布的好物分享（二次确认后执行）
+  const handleConfirmDelete = async () => {
+    if (!pendingDelete || deleting) return;
+    const id = pendingDelete.id;
+    setDeleting(true);
+    const res = await removeGoodItem(id, currentUser.id);
+    setDeleting(false);
+    setPendingDelete(null);
+    if (!res.success) {
+      window.alert(res.error);
+      return;
+    }
+    setItems(prev => prev.filter(i => i.id !== id));
+    if (!res.cloudSynced) {
+      window.alert(res.warning || '已从本机删除，但云端同步暂时失败，其他设备可能仍能看到，请稍后重试。');
+    }
+  };
 
   const loadData = async () => {
     try {
@@ -212,9 +235,21 @@ export default function GoodItemsPage() {
                   )}
                 </div>
 
-                <span className="text-[10px] font-mono text-slate-400">
-                  {new Date(item.created_at).toLocaleDateString('zh-CN')}
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-mono text-slate-400">
+                    {new Date(item.created_at).toLocaleDateString('zh-CN')}
+                  </span>
+                  {item.creator_id === currentUser.id && (
+                    <button
+                      onClick={() => setPendingDelete(item)}
+                      className="flex items-center gap-1 text-[10px] font-bold text-rose-500 hover:text-rose-700 hover:bg-rose-50 px-1.5 py-0.5 rounded-lg transition cursor-pointer"
+                      title="删除我分享的好物"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                      <span>删除</span>
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
           ))}
@@ -227,6 +262,18 @@ export default function GoodItemsPage() {
         onClose={() => setShowShareModal(false)}
         onCreated={handleCreated}
       />
+
+      {/* 删除确认 */}
+      {pendingDelete && (
+        <ConfirmDeleteModal
+          title="删除这件好物分享？"
+          message="删除后将立即从好物库和所有人的页面消失，且无法恢复。"
+          detail={pendingDelete.title || ''}
+          loading={deleting}
+          onConfirm={handleConfirmDelete}
+          onCancel={() => setPendingDelete(null)}
+        />
+      )}
     </div>
   );
 }

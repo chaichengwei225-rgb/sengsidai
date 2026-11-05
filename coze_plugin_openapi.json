@@ -3,7 +3,7 @@
   "info": {
     "title": "省思袋冲动消费审批API",
     "description": "省思袋全网审批流同步、消费数据查询与AI劝退决策插件",
-    "version": "1.1.0"
+    "version": "1.2.0"
   },
   "servers": [
     {
@@ -37,9 +37,9 @@
         }
       },
       "post": {
-        "operationId": "createApprovalOrVote",
-        "summary": "向全网广播发起一笔新审批或提交表态投票",
-        "description": "字段名必须是 action（不是 type）。取值需与后端一致：create_approval / update_approval / create_vote / create_comment / create_good_item。",
+        "operationId": "syncDataAction",
+        "summary": "同步一笔数据变更（创建 / 更新 / 删除）",
+        "description": "字段名必须是 action（不是 type）。创建与更新：create_approval / update_approval / create_vote / create_comment / create_good_item，payload 为对应内容对象。删除：delete_approval / delete_good_item / delete_comment，payload 必须传 { id, userId }；服务端校验 userId 与内容的 creator_id（留言为 user_id）一致，不一致返回 403。删除审批单会级联清除该单的投票与讨论，重复删除返回 200 幂等结果。",
         "requestBody": {
           "required": true,
           "content": {
@@ -54,11 +54,25 @@
                       "update_approval",
                       "create_vote",
                       "create_comment",
-                      "create_good_item"
+                      "create_good_item",
+                      "delete_approval",
+                      "delete_good_item",
+                      "delete_comment"
                     ]
                   },
                   "payload": {
-                    "type": "object"
+                    "type": "object",
+                    "description": "创建/更新时为内容对象；删除时为 { id: 内容ID, userId: 发布者的匿名ID }。",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "description": "仅删除类 action 需要，为要删除的内容 ID"
+                      },
+                      "userId": {
+                        "type": "string",
+                        "description": "仅删除类 action 需要，必须与发布者 ID 一致，否则返回 403"
+                      }
+                    }
                   }
                 },
                 "required": [
@@ -72,6 +86,9 @@
         "responses": {
           "200": {
             "description": "提交成功"
+          },
+          "403": {
+            "description": "删除被拒绝：userId 缺失或与发布者 ID 不一致"
           }
         }
       }

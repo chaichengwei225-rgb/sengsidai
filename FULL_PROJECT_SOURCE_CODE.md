@@ -36,7 +36,6 @@
     "vite": "^8.3.4"
   }
 }
-
 ```
 
 ---
@@ -55,7 +54,6 @@ export default defineConfig({
     react(),
   ],
 })
-
 ```
 
 ---
@@ -121,7 +119,6 @@ export default defineConfig({
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>
-
 ```
 
 ---
@@ -194,7 +191,6 @@ createRoot(document.getElementById('root')).render(
     </ErrorBoundary>
   </StrictMode>,
 );
-
 ```
 
 ---
@@ -305,7 +301,6 @@ export default function App() {
     </div>
   );
 }
-
 ```
 
 ---
@@ -402,7 +397,6 @@ iframe[srcdoc*="Powered by"],
   top: -9999px !important;
   z-index: -9999 !important;
 }
-
 ```
 
 ---
@@ -501,7 +495,6 @@ export const QUICK_REASONS = {
     "这题超纲了，把决定权交给更有经验的网友"
   ]
 };
-
 ```
 
 ---
@@ -606,7 +599,6 @@ export function resetUserProfile() {
   }
   return newUser;
 }
-
 ```
 
 ---
@@ -762,7 +754,6 @@ export async function autoSettleApproval(approval, votes = []) {
 
   return { ...approval, status: result };
 }
-
 ```
 
 ---
@@ -780,6 +771,36 @@ const STORAGE_KEYS = {
   COMMENTS: 'sengsidai_cloud_comments',
   GOOD_ITEMS: 'sengsidai_cloud_good_items',
 };
+
+const DELETED_KEY = 'sengsidai_deleted_ids';
+
+// 删除墓碑：云端同步偶尔失败时，防止已删内容被下一次全量拉取「复活」
+function getDeletedIds() {
+  try {
+    if (typeof localStorage === 'undefined') return new Set();
+    return new Set(JSON.parse(localStorage.getItem(DELETED_KEY) || '[]'));
+  } catch (e) {
+    return new Set();
+  }
+}
+
+function markDeleted(id) {
+  try {
+    if (typeof localStorage === 'undefined' || !id) return;
+    const ids = getDeletedIds();
+    ids.add(id);
+    localStorage.setItem(DELETED_KEY, JSON.stringify([...ids].slice(-500)));
+  } catch (e) {
+    console.warn('[CloudStore] mark deleted failed:', e);
+  }
+}
+
+function filterDeleted(list, deleted, parentKey) {
+  if (!Array.isArray(list)) return list;
+  return list.filter(item =>
+    !deleted.has(item.id) && (!parentKey || !deleted.has(item[parentKey]))
+  );
+}
 
 // 内存单例缓存
 let localCache = {
@@ -835,6 +856,7 @@ function notifyUpdate() {
  */
 export async function syncFromCloud() {
   initCache();
+  const deleted = getDeletedIds();
 
   // 如果配置了 Supabase，走 Supabase 流程
   if (isSupabaseConfigured()) {
@@ -848,20 +870,20 @@ export async function syncFromCloud() {
           client.from('good_items').select('*').order('created_at', { ascending: false }),
         ]);
         if (apps) {
-          localCache.approvals = apps;
-          setLocal(STORAGE_KEYS.APPROVALS, apps);
+          localCache.approvals = filterDeleted(apps, deleted);
+          setLocal(STORAGE_KEYS.APPROVALS, localCache.approvals);
         }
         if (vts) {
-          localCache.votes = vts;
-          setLocal(STORAGE_KEYS.VOTES, vts);
+          localCache.votes = filterDeleted(vts, deleted, 'approval_id');
+          setLocal(STORAGE_KEYS.VOTES, localCache.votes);
         }
         if (cmts) {
-          localCache.comments = cmts;
-          setLocal(STORAGE_KEYS.COMMENTS, cmts);
+          localCache.comments = filterDeleted(cmts, deleted, 'approval_id');
+          setLocal(STORAGE_KEYS.COMMENTS, localCache.comments);
         }
         if (gds && gds.length > 0) {
-          localCache.goodItems = gds;
-          setLocal(STORAGE_KEYS.GOOD_ITEMS, gds);
+          localCache.goodItems = filterDeleted(gds, deleted);
+          setLocal(STORAGE_KEYS.GOOD_ITEMS, localCache.goodItems);
         }
         notifyUpdate();
         return localCache;
@@ -882,20 +904,20 @@ export async function syncFromCloud() {
       if (result && result.success && result.data) {
         const { approvals, votes, comments, goodItems } = result.data;
         if (Array.isArray(approvals)) {
-          localCache.approvals = approvals;
-          setLocal(STORAGE_KEYS.APPROVALS, approvals);
+          localCache.approvals = filterDeleted(approvals, deleted);
+          setLocal(STORAGE_KEYS.APPROVALS, localCache.approvals);
         }
         if (Array.isArray(votes)) {
-          localCache.votes = votes;
-          setLocal(STORAGE_KEYS.VOTES, votes);
+          localCache.votes = filterDeleted(votes, deleted, 'approval_id');
+          setLocal(STORAGE_KEYS.VOTES, localCache.votes);
         }
         if (Array.isArray(comments)) {
-          localCache.comments = comments;
-          setLocal(STORAGE_KEYS.COMMENTS, comments);
+          localCache.comments = filterDeleted(comments, deleted, 'approval_id');
+          setLocal(STORAGE_KEYS.COMMENTS, localCache.comments);
         }
         if (Array.isArray(goodItems)) {
-          localCache.goodItems = goodItems;
-          setLocal(STORAGE_KEYS.GOOD_ITEMS, goodItems);
+          localCache.goodItems = filterDeleted(goodItems, deleted);
+          setLocal(STORAGE_KEYS.GOOD_ITEMS, localCache.goodItems);
         }
         notifyUpdate();
         return localCache;
@@ -1143,6 +1165,139 @@ export function getCachedGoodItems() {
   return localCache.goodItems;
 }
 
+/**
+ * 向云端共享池发起删除请求，区分「成功 / 后端拒绝 / 网络失败」三种结果。
+ * 只看 res.ok 会把 403 无权限误报成网络故障，所以解析响应体里的 error。
+ */
+async function postDelete(action, payload) {
+  try {
+    const res = await fetch('/api/sync-data', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, payload })
+    });
+    let body = null;
+    try {
+      body = await res.json();
+    } catch {
+      // 非 JSON 响应（代理错误页等）按 HTTP 状态兜底
+    }
+    if (res.ok && body?.success !== false) {
+      return { cloudSynced: true, warning: '' };
+    }
+    return {
+      cloudSynced: false,
+      warning: body?.error
+        ? `本机已删除，但云端拒绝了该请求：${body.error}。其他设备可能仍能看到，请稍后重试。`
+        : `本机已删除，但云端同步未生效（HTTP ${res.status}），其他设备可能仍能看到，请稍后重试。`,
+    };
+  } catch (e) {
+    console.warn('[CloudStore] Sync delete error:', e);
+    return {
+      cloudSynced: false,
+      warning: '本机已删除，但云端同步暂时失败，其他设备可能仍能看到，请稍后重试。',
+    };
+  }
+}
+
+/**
+ * 删除本人发布的审批单（级联清理该单的投票与讨论）
+ * 三层同步删除：本地缓存 + Supabase（若配置）+ 云端共享 Blob
+ */
+export async function deleteApproval(approvalId, userId) {
+  initCache();
+  const target = localCache.approvals.find(a => a.id === approvalId);
+  if (!target) return { success: false, error: '内容不存在或已被删除' };
+  if (!userId || target.creator_id !== userId) {
+    return { success: false, error: '只能删除自己发布的内容' };
+  }
+
+  markDeleted(approvalId);
+  localCache.approvals = localCache.approvals.filter(a => a.id !== approvalId);
+  localCache.votes = localCache.votes.filter(v => v.approval_id !== approvalId);
+  localCache.comments = localCache.comments.filter(c => c.approval_id !== approvalId);
+  setLocal(STORAGE_KEYS.APPROVALS, localCache.approvals);
+  setLocal(STORAGE_KEYS.VOTES, localCache.votes);
+  setLocal(STORAGE_KEYS.COMMENTS, localCache.comments);
+  notifyUpdate();
+
+  if (isSupabaseConfigured()) {
+    const client = getSupabase();
+    if (client) {
+      try {
+        // votes / comments 由数据库外键 ON DELETE CASCADE 自动级联清理
+        await client.from('approvals').delete().eq('id', approvalId).eq('creator_id', userId);
+      } catch (e) {
+        console.warn('[CloudStore] Supabase delete approval failed:', e);
+      }
+    }
+  }
+
+  const { cloudSynced, warning } = await postDelete('delete_approval', { id: approvalId, userId });
+  return { success: true, cloudSynced, warning };
+}
+
+/**
+ * 删除本人发布的好物分享
+ */
+export async function deleteGoodItem(itemId, userId) {
+  initCache();
+  const target = localCache.goodItems.find(g => g.id === itemId);
+  if (!target) return { success: false, error: '内容不存在或已被删除' };
+  if (!userId || target.creator_id !== userId) {
+    return { success: false, error: '只能删除自己发布的内容' };
+  }
+
+  markDeleted(itemId);
+  localCache.goodItems = localCache.goodItems.filter(g => g.id !== itemId);
+  setLocal(STORAGE_KEYS.GOOD_ITEMS, localCache.goodItems);
+  notifyUpdate();
+
+  if (isSupabaseConfigured()) {
+    const client = getSupabase();
+    if (client) {
+      try {
+        await client.from('good_items').delete().eq('id', itemId).eq('creator_id', userId);
+      } catch (e) {
+        console.warn('[CloudStore] Supabase delete good item failed:', e);
+      }
+    }
+  }
+
+  const { cloudSynced, warning } = await postDelete('delete_good_item', { id: itemId, userId });
+  return { success: true, cloudSynced, warning };
+}
+
+/**
+ * 删除本人发布的讨论留言
+ */
+export async function deleteComment(commentId, userId) {
+  initCache();
+  const target = localCache.comments.find(c => c.id === commentId);
+  if (!target) return { success: false, error: '留言不存在或已被删除' };
+  if (!userId || target.user_id !== userId) {
+    return { success: false, error: '只能删除自己发布的留言' };
+  }
+
+  markDeleted(commentId);
+  localCache.comments = localCache.comments.filter(c => c.id !== commentId);
+  setLocal(STORAGE_KEYS.COMMENTS, localCache.comments);
+  notifyUpdate();
+
+  if (isSupabaseConfigured()) {
+    const client = getSupabase();
+    if (client) {
+      try {
+        await client.from('comments').delete().eq('id', commentId).eq('user_id', userId);
+      } catch (e) {
+        console.warn('[CloudStore] Supabase delete comment failed:', e);
+      }
+    }
+  }
+
+  const { cloudSynced, warning } = await postDelete('delete_comment', { id: commentId, userId });
+  return { success: true, cloudSynced, warning };
+}
 ```
 
 ---
@@ -1153,7 +1308,8 @@ export function getCachedGoodItems() {
 import { 
   syncFromCloud, 
   getCachedGoodItems, 
-  createGoodItem as createCloudGoodItem 
+  createGoodItem as createCloudGoodItem,
+  deleteGoodItem as deleteCloudGoodItem
 } from './cloudStore';
 import { INITIAL_GOOD_ITEMS } from './goodItemsFallback';
 
@@ -1193,6 +1349,12 @@ export async function createGoodItem(item) {
   }
 }
 
+/**
+ * 删除本人发布的好物分享（全网同步）
+ */
+export async function removeGoodItem(itemId, userId) {
+  return deleteCloudGoodItem(itemId, userId);
+}
 ```
 
 ---
@@ -1255,7 +1417,6 @@ export const INITIAL_GOOD_ITEMS = [
     created_at: new Date(Date.now() - 4 * 3600 * 1000).toISOString(),
   }
 ];
-
 ```
 
 ---
@@ -1439,7 +1600,6 @@ export const INITIAL_SEED_VOTES = [
   { approval_id: '33333333-3333-3333-3333-333333333333', voter_id: 'v_24', voter_nickname: '开心最重要', type: 'approve', owns_item: false, reason: '周五都加班到这个点了，喝杯奶茶怎么了！对自己好点！', created_at: new Date(Date.now() - 1 * 3600 * 1000).toISOString() },
   { approval_id: '33333333-3333-3333-3333-333333333333', voter_id: 'v_25', voter_nickname: '同病相怜同事', type: 'approve', owns_item: true, reason: '加份啵啵咬一咬发泄一下，准了！', created_at: new Date(Date.now() - 30 * 60 * 1000).toISOString() },
 ];
-
 ```
 
 ---
@@ -1506,7 +1666,6 @@ export function isSupabaseConfigured() {
   const { url, key } = getSupabaseCredentials();
   return Boolean(url && key && url.startsWith('http'));
 }
-
 ```
 
 ---
@@ -1764,7 +1923,6 @@ export function generateInitialAiAdvice(approval) {
     creator_mbti: approval.creator_mbti,
   });
 }
-
 ```
 
 ---
@@ -1920,7 +2078,6 @@ export default function Navbar({ onOpenConfig }) {
     </header>
   );
 }
-
 ```
 
 ---
@@ -1996,7 +2153,6 @@ export default function BottomNav() {
     </div>
   );
 }
-
 ```
 
 ---
@@ -2006,12 +2162,12 @@ export default function BottomNav() {
 ```javascript
 import React from 'react';
 import { Link } from 'wouter';
-import { ThumbsUp, ThumbsDown, Share2, Sparkles, Bot, ArrowRight } from 'lucide-react';
+import { ThumbsUp, ThumbsDown, Share2, Sparkles, Bot, ArrowRight, Trash2 } from 'lucide-react';
 import CountdownTimer from './CountdownTimer';
 import { ROAST_MESSAGES } from '../lib/constants';
 import { calculateApprovalTally } from '../lib/settle';
 
-export default function ApprovalCard({ approval, votes = [], onShare, isOwner = false }) {
+export default function ApprovalCard({ approval, votes = [], onShare, isOwner = false, onDelete }) {
   // 计算综合票数分解
   const tally = calculateApprovalTally(approval, votes);
   const totalDecisive = tally.humanApprove + tally.humanReject;
@@ -2178,6 +2334,17 @@ export default function ApprovalCard({ approval, votes = [], onShare, isOwner = 
             <span>求劝退</span>
           </button>
 
+          {isOwner && onDelete && (
+            <button
+              onClick={() => onDelete(approval)}
+              className="flex items-center gap-1 text-xs text-rose-500 hover:text-rose-700 py-1.5 px-2.5 rounded-xl hover:bg-rose-50 transition cursor-pointer shrink-0"
+              title="删除我发布的这条审批"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>删除</span>
+            </button>
+          )}
+
           <Link
             href={`/approval/${approval.id}`}
             className="flex-1 py-1.5 px-3 bg-gradient-to-r from-amber-500 to-yellow-400 hover:from-amber-600 hover:to-yellow-500 text-white rounded-xl text-xs font-bold transition flex items-center justify-center gap-1 shadow-2xs active:scale-95 cursor-pointer"
@@ -2190,7 +2357,6 @@ export default function ApprovalCard({ approval, votes = [], onShare, isOwner = 
     </div>
   );
 }
-
 ```
 
 ---
@@ -2442,7 +2608,6 @@ export default function AiVerdictCard({ approval, votes = [], onUpdateApproval }
     </div>
   );
 }
-
 ```
 
 ---
@@ -2519,7 +2684,6 @@ export default function CountdownTimer({ deadline, status, onExpire, compact = f
     </div>
   );
 }
-
 ```
 
 ---
@@ -2637,7 +2801,6 @@ ${approval.expected_duration ? `预计使用时间：${approval.expected_duratio
     </div>
   );
 }
-
 ```
 
 ---
@@ -2862,7 +3025,6 @@ export default function ShareGoodItemModal({ isOpen, onClose, onCreated }) {
     </div>
   );
 }
-
 ```
 
 ---
@@ -3064,7 +3226,6 @@ export default function ConfigModal({ onClose }) {
     </div>
   );
 }
-
 ```
 
 ---
@@ -3257,7 +3418,6 @@ export default function OnboardingModal({ user, onComplete }) {
     </div>
   );
 }
-
 ```
 
 ---
@@ -3274,7 +3434,8 @@ import { CATEGORIES } from '../lib/constants';
 import { getSupabase } from '../lib/supabase';
 import { autoSettleApproval } from '../lib/settle';
 import { getCurrentUser } from '../lib/user';
-import { syncFromCloud, getCachedApprovals, getCachedVotes } from '../lib/cloudStore';
+import { syncFromCloud, getCachedApprovals, getCachedVotes, deleteApproval } from '../lib/cloudStore';
+import ConfirmDeleteModal from '../components/ConfirmDeleteModal';
 
 export default function SquarePage({ onOpenConfig }) {
   const [currentUser, setCurrentUser] = useState(getCurrentUser());
@@ -3286,6 +3447,22 @@ export default function SquarePage({ onOpenConfig }) {
   const [loading, setLoading] = useState(false);
   const [sharingApproval, setSharingApproval] = useState(null);
   const [newIncomingCount, setNewIncomingCount] = useState(0);
+  const [pendingDelete, setPendingDelete] = useState(null);
+  const [deleting, setDeleting] = useState(false);
+
+  // 删除本人发布的审批单（二次确认后执行）
+  const handleConfirmDelete = async () => {
+    if (!pendingDelete || deleting) return;
+    setDeleting(true);
+    const res = await deleteApproval(pendingDelete.id, currentUser.id);
+    setDeleting(false);
+    setPendingDelete(null);
+    if (!res.success) {
+      window.alert(res.error);
+    } else if (!res.cloudSynced) {
+      window.alert(res.warning || '已从本机删除，但云端同步暂时失败，其他设备可能仍能看到，请稍后重试。');
+    }
+  };
 
   useEffect(() => {
     const handleUserUpdate = (e) => setCurrentUser(e.detail);
@@ -3569,6 +3746,8 @@ export default function SquarePage({ onOpenConfig }) {
               approval={app}
               votes={votes.filter(v => v.approval_id === app.id)}
               onShare={(a) => setSharingApproval(a)}
+              isOwner={app.creator_id === currentUser.id}
+              onDelete={(a) => setPendingDelete(a)}
             />
           ))}
         </div>
@@ -3581,10 +3760,21 @@ export default function SquarePage({ onOpenConfig }) {
           onClose={() => setSharingApproval(null)} 
         />
       )}
+
+      {/* 删除确认 */}
+      {pendingDelete && (
+        <ConfirmDeleteModal
+          title="删除这条消费审批？"
+          message="删除后将立即从你和所有人的页面消失，关联的投票与讨论也会一并清除，且无法恢复。"
+          detail={pendingDelete.title || ''}
+          loading={deleting}
+          onConfirm={handleConfirmDelete}
+          onCancel={() => setPendingDelete(null)}
+        />
+      )}
     </div>
   );
 }
-
 ```
 
 ---
@@ -4409,7 +4599,6 @@ export default function CreatePage() {
     </div>
   );
 }
-
 ```
 
 ---
@@ -4418,11 +4607,11 @@ export default function CreatePage() {
 
 ```javascript
 import React, { useState, useEffect, useMemo } from 'react';
-import { useRoute, Link } from 'wouter';
+import { useRoute, Link, useLocation } from 'wouter';
 import { 
   ArrowLeft, Clock, ThumbsUp, ThumbsDown, Eye, Share2, 
   MessageSquare, Sparkles, AlertCircle, CheckCircle2, XCircle, Send, UserCheck, ShieldAlert,
-  Bot, Tag
+  Bot, Tag, Trash2
 } from 'lucide-react';
 import CountdownTimer from '../components/CountdownTimer';
 import ShareModal from '../components/ShareModal';
@@ -4433,8 +4622,10 @@ import { getSupabase } from '../lib/supabase';
 import { autoSettleApproval, calculateApprovalTally } from '../lib/settle';
 import { 
   syncFromCloud, getCachedApprovals, getCachedVotes, 
-  getCachedComments, submitVote, submitComment, updateApproval 
+  getCachedComments, submitVote, submitComment, updateApproval,
+  deleteApproval, deleteComment 
 } from '../lib/cloudStore';
+import ConfirmDeleteModal from '../components/ConfirmDeleteModal';
 import confetti from 'canvas-confetti';
 
 export default function DetailPage() {
@@ -4442,12 +4633,15 @@ export default function DetailPage() {
   const approvalId = params?.id;
 
   const currentUser = getCurrentUser();
+  const [, setLocation] = useLocation();
 
   const [approval, setApproval] = useState(null);
   const [votes, setVotes] = useState([]);
   const [comments, setComments] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showShareModal, setShowShareModal] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState(null);
+  const [deleting, setDeleting] = useState(false);
 
   // 投票前置选项：是否已拥有该物品（null | true | false）
   const [ownsItem, setOwnsItem] = useState(null);
@@ -4587,6 +4781,30 @@ export default function DetailPage() {
     return votes.find(v => v.voter_id === currentUser.id);
   }, [votes, currentUser.id]);
 
+  // 删除本人发布的内容（审批单 / 讨论留言）
+  const handleConfirmDelete = async () => {
+    if (!pendingDelete || deleting) return;
+    const target = pendingDelete;
+    setDeleting(true);
+    const res = target.type === 'approval'
+      ? await deleteApproval(target.id, currentUser.id)
+      : await deleteComment(target.id, currentUser.id);
+    setDeleting(false);
+    setPendingDelete(null);
+    if (!res.success) {
+      window.alert(res.error);
+      return;
+    }
+    if (!res.cloudSynced) {
+      window.alert(res.warning || '已从本机删除，但云端同步暂时失败，其他设备可能仍能看到，请稍后重试。');
+    }
+    if (target.type === 'approval') {
+      setLocation('/');
+    } else {
+      setComments(prev => prev.filter(c => c.id !== target.id));
+    }
+  };
+
   // 提交投票
   const handleVoteSubmit = async (e) => {
     e.preventDefault();
@@ -4725,15 +4943,27 @@ export default function DetailPage() {
           <span>返回广场大厅</span>
         </Link>
 
-        <button
-          onClick={() => {
-            setShowShareModal(true);
-          }}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-100 hover:bg-amber-200/80 text-amber-800 font-bold text-xs rounded-xl transition shadow-2xs active:scale-95"
-        >
-          <Share2 className="w-3.5 h-3.5" />
-          <span>分享审批群 / 劝退口令</span>
-        </button>
+        <div className="flex items-center gap-2">
+          {isCreator && (
+            <button
+              onClick={() => setPendingDelete({ type: 'approval', id: approval.id, title: approval.title })}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-600 font-bold text-xs rounded-xl transition active:scale-95 cursor-pointer"
+              title="删除我发布的这条审批"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>删除</span>
+            </button>
+          )}
+          <button
+            onClick={() => {
+              setShowShareModal(true);
+            }}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-100 hover:bg-amber-200/80 text-amber-800 font-bold text-xs rounded-xl transition shadow-2xs active:scale-95"
+          >
+            <Share2 className="w-3.5 h-3.5" />
+            <span>分享审批群 / 劝退口令</span>
+          </button>
+        </div>
       </div>
 
       {/* 核心商品卡片 */}
@@ -5230,9 +5460,20 @@ export default function DetailPage() {
               <div key={c.id || c.created_at} className="bg-amber-50/40 p-3 rounded-2xl border border-amber-100/60 text-xs animate-fadeIn">
                 <div className="flex items-center justify-between text-slate-500 mb-1 text-[11px]">
                   <span className="font-bold text-slate-700">@{c.user_nickname}</span>
-                  <span className="font-mono text-[10px]">
-                    {new Date(c.created_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-[10px]">
+                      {new Date(c.created_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
+                    </span>
+                    {c.user_id === currentUser.id && (
+                      <button
+                        onClick={() => setPendingDelete({ type: 'comment', id: c.id, title: c.content })}
+                        className="text-rose-400 hover:text-rose-600 transition cursor-pointer"
+                        title="删除我的留言"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div className="text-slate-800">{c.content}</div>
               </div>
@@ -5266,10 +5507,23 @@ export default function DetailPage() {
           onClose={() => setShowShareModal(false)}
         />
       )}
+
+      {/* 删除确认 */}
+      {pendingDelete && (
+        <ConfirmDeleteModal
+          title={pendingDelete.type === 'approval' ? '删除这条消费审批？' : '删除这条留言？'}
+          message={pendingDelete.type === 'approval'
+            ? '删除后整条审批、所有投票与讨论都会从全网消失，且无法恢复。'
+            : '删除后这条留言会从讨论区消失，且无法恢复。'}
+          detail={pendingDelete.title || ''}
+          loading={deleting}
+          onConfirm={handleConfirmDelete}
+          onCancel={() => setPendingDelete(null)}
+        />
+      )}
     </div>
   );
 }
-
 ```
 
 ---
@@ -5286,7 +5540,8 @@ import { getCurrentUser } from '../lib/user';
 import { getSupabase } from '../lib/supabase';
 import { ROAST_MESSAGES } from '../lib/constants';
 import { autoSettleApproval } from '../lib/settle';
-import { syncFromCloud, getCachedApprovals, getCachedVotes } from '../lib/cloudStore';
+import { syncFromCloud, getCachedApprovals, getCachedVotes, deleteApproval } from '../lib/cloudStore';
+import ConfirmDeleteModal from '../components/ConfirmDeleteModal';
 
 export default function RecordsPage() {
   const [currentUser] = useState(() => getCurrentUser());
@@ -5298,6 +5553,22 @@ export default function RecordsPage() {
   const [loading, setLoading] = useState(false);
   const [statusFilter, setStatusFilter] = useState('all'); // 'all' | 'rejected' | 'approved' | 'pending'
   const [sharingApproval, setSharingApproval] = useState(null);
+  const [pendingDelete, setPendingDelete] = useState(null);
+  const [deleting, setDeleting] = useState(false);
+
+  // 删除本人发布的审批单（二次确认后执行）
+  const handleConfirmDelete = async () => {
+    if (!pendingDelete || deleting) return;
+    setDeleting(true);
+    const res = await deleteApproval(pendingDelete.id, currentUser.id);
+    setDeleting(false);
+    setPendingDelete(null);
+    if (!res.success) {
+      window.alert(res.error);
+    } else if (!res.cloudSynced) {
+      window.alert(res.warning || '已从本机删除，但云端同步暂时失败，其他设备可能仍能看到，请稍后重试。');
+    }
+  };
 
   // 获取属于当前用户的审批与战报
   const fetchRecords = async (isManual = false) => {
@@ -5537,6 +5808,7 @@ export default function RecordsPage() {
               votes={votes.filter(v => v.approval_id === app.id)}
               onShare={(a) => setSharingApproval(a)}
               isOwner={true}
+              onDelete={(a) => setPendingDelete(a)}
             />
           ))}
         </div>
@@ -5549,10 +5821,21 @@ export default function RecordsPage() {
           onClose={() => setSharingApproval(null)} 
         />
       )}
+
+      {/* 删除确认 */}
+      {pendingDelete && (
+        <ConfirmDeleteModal
+          title="删除这条消费审批？"
+          message="删除后将立即从你和所有人的页面消失，关联的投票与讨论也会一并清除，且无法恢复。"
+          detail={pendingDelete.title || ''}
+          loading={deleting}
+          onConfirm={handleConfirmDelete}
+          onCancel={() => setPendingDelete(null)}
+        />
+      )}
     </div>
   );
 }
-
 ```
 
 ---
@@ -5810,7 +6093,6 @@ export default function MyPage({ onOpenConfig }) {
     </div>
   );
 }
-
 ```
 
 ---
@@ -5819,9 +6101,11 @@ export default function MyPage({ onOpenConfig }) {
 
 ```javascript
 import React, { useState, useEffect } from 'react';
-import { Sparkles, Plus, Image as ImageIcon, Search, Tag, User, Clock, Heart } from 'lucide-react';
+import { Sparkles, Plus, Image as ImageIcon, Search, Tag, User, Clock, Heart, Trash2 } from 'lucide-react';
 import ShareGoodItemModal from '../components/ShareGoodItemModal';
-import { fetchGoodItems, getLocalGoodItems } from '../lib/goodItems';
+import { fetchGoodItems, getLocalGoodItems, removeGoodItem } from '../lib/goodItems';
+import { getCurrentUser } from '../lib/user';
+import ConfirmDeleteModal from '../components/ConfirmDeleteModal';
 
 // 好物卡片图片组件（固定比例，真实图片优先，样式统一）
 function GoodItemImage({ src, alt }) {
@@ -5865,6 +6149,27 @@ export default function GoodItemsPage() {
   const [loading, setLoading] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
+  const [currentUser] = useState(() => getCurrentUser());
+  const [pendingDelete, setPendingDelete] = useState(null);
+  const [deleting, setDeleting] = useState(false);
+
+  // 删除本人发布的好物分享（二次确认后执行）
+  const handleConfirmDelete = async () => {
+    if (!pendingDelete || deleting) return;
+    const id = pendingDelete.id;
+    setDeleting(true);
+    const res = await removeGoodItem(id, currentUser.id);
+    setDeleting(false);
+    setPendingDelete(null);
+    if (!res.success) {
+      window.alert(res.error);
+      return;
+    }
+    setItems(prev => prev.filter(i => i.id !== id));
+    if (!res.cloudSynced) {
+      window.alert(res.warning || '已从本机删除，但云端同步暂时失败，其他设备可能仍能看到，请稍后重试。');
+    }
+  };
 
   const loadData = async () => {
     try {
@@ -6032,9 +6337,21 @@ export default function GoodItemsPage() {
                   )}
                 </div>
 
-                <span className="text-[10px] font-mono text-slate-400">
-                  {new Date(item.created_at).toLocaleDateString('zh-CN')}
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-mono text-slate-400">
+                    {new Date(item.created_at).toLocaleDateString('zh-CN')}
+                  </span>
+                  {item.creator_id === currentUser.id && (
+                    <button
+                      onClick={() => setPendingDelete(item)}
+                      className="flex items-center gap-1 text-[10px] font-bold text-rose-500 hover:text-rose-700 hover:bg-rose-50 px-1.5 py-0.5 rounded-lg transition cursor-pointer"
+                      title="删除我分享的好物"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                      <span>删除</span>
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
           ))}
@@ -6047,10 +6364,21 @@ export default function GoodItemsPage() {
         onClose={() => setShowShareModal(false)}
         onCreated={handleCreated}
       />
+
+      {/* 删除确认 */}
+      {pendingDelete && (
+        <ConfirmDeleteModal
+          title="删除这件好物分享？"
+          message="删除后将立即从好物库和所有人的页面消失，且无法恢复。"
+          detail={pendingDelete.title || ''}
+          loading={deleting}
+          onConfirm={handleConfirmDelete}
+          onCancel={() => setPendingDelete(null)}
+        />
+      )}
     </div>
   );
 }
-
 ```
 
 ---
@@ -6258,7 +6586,37 @@ let memoryState = {
   votes: [...DEFAULT_VOTES],
   comments: [...DEFAULT_COMMENTS],
   goodItems: [...DEFAULT_GOOD_ITEMS],
+  deletedIds: [],
 };
+
+// 云端删除墓碑上限，避免 Blob 无限膨胀
+const MAX_DELETED_IDS = 500;
+
+/**
+ * 归一化历史数据。
+ * 早期版本写入的 Blob 可能缺少 goodItems / comments / votes / deletedIds，
+ * 若不补全，删除与 ?limit= 分支会对 undefined 调用 find / slice 而返回 500。
+ */
+function normalizeData(raw) {
+  const safe = raw && typeof raw === 'object' ? raw : {};
+  return {
+    ...safe,
+    approvals: Array.isArray(safe.approvals) ? safe.approvals : [...DEFAULT_APPROVALS],
+    votes: Array.isArray(safe.votes) ? safe.votes : [...DEFAULT_VOTES],
+    comments: Array.isArray(safe.comments) ? safe.comments : [...DEFAULT_COMMENTS],
+    goodItems: Array.isArray(safe.goodItems) ? safe.goodItems : [...DEFAULT_GOOD_ITEMS],
+    deletedIds: Array.isArray(safe.deletedIds) ? safe.deletedIds : [],
+  };
+}
+
+function isDeleted(data, id) {
+  return Boolean(id) && data.deletedIds.includes(id);
+}
+
+function markDeleted(data, id) {
+  if (!id) return;
+  data.deletedIds = [...data.deletedIds.filter(x => x !== id), id].slice(-MAX_DELETED_IDS);
+}
 
 function getBlobStore() {
   try {
@@ -6270,36 +6628,35 @@ function getBlobStore() {
 
 async function loadAllData() {
   const store = getBlobStore();
-  if (!store) return memoryState;
+  if (!store) return normalizeData(memoryState);
 
   try {
     const raw = await store.get('all_data', { type: 'json' });
     if (raw && typeof raw === 'object' && Array.isArray(raw.approvals)) {
+      const data = normalizeData(raw);
       // 自动修复旧的好物图片链接
-      if (Array.isArray(raw.goodItems)) {
-        raw.goodItems = raw.goodItems.map(item => {
-          if (item.id === 'g-001' || (item.title && item.title.includes('办公椅'))) {
-            if (!item.image_url || item.image_url.includes('1580481077197') || item.image_url.includes('unsplash.com')) {
-              return { ...item, image_url: '/office-chair.jpg' };
-            }
+      data.goodItems = data.goodItems.map(item => {
+        if (item.id === 'g-001' || (item.title && item.title.includes('办公椅'))) {
+          if (!item.image_url || item.image_url.includes('1580481077197') || item.image_url.includes('unsplash.com')) {
+            return { ...item, image_url: '/office-chair.jpg' };
           }
-          return item;
-        });
-      }
-      return raw;
+        }
+        return item;
+      });
+      return data;
     }
     // 初次使用，写入初始数据
-    const initData = {
+    const initData = normalizeData({
       approvals: DEFAULT_APPROVALS,
       votes: DEFAULT_VOTES,
       comments: DEFAULT_COMMENTS,
       goodItems: DEFAULT_GOOD_ITEMS,
-    };
+    });
     await store.setJSON('all_data', initData);
     return initData;
   } catch (err) {
     console.warn('[SyncData] Netlify Blob read error, fallback to memory:', err);
-    return memoryState;
+    return normalizeData(memoryState);
   }
 }
 
@@ -6344,14 +6701,18 @@ export default async (req) => {
         // req.url 异常时退化为全量，不影响原有调用方
       }
 
+      // deletedIds 是服务端内部墓碑，不暴露给前端 / Coze，避免无谓增大响应体
+      const publicData = { ...data };
+      delete publicData.deletedIds;
+
       const payload = limit
         ? {
-            approvals: data.approvals.slice(0, limit),
-            votes: data.votes.slice(0, limit * 20),
-            comments: data.comments.slice(0, limit * 20),
-            goodItems: data.goodItems.slice(0, limit),
+            approvals: publicData.approvals.slice(0, limit),
+            votes: publicData.votes.slice(0, limit * 20),
+            comments: publicData.comments.slice(0, limit * 20),
+            goodItems: publicData.goodItems.slice(0, limit),
           }
-        : data;
+        : publicData;
 
       return new Response(JSON.stringify({ success: true, data: payload }), { status: 200, headers });
     }
@@ -6369,6 +6730,9 @@ export default async (req) => {
           created_at: payload.created_at || new Date().toISOString(),
           status: payload.status || 'pending',
         };
+        if (isDeleted(data, newApproval.id)) {
+          return new Response(JSON.stringify({ success: true, approval: newApproval, skipped: true }), { status: 200, headers });
+        }
         data.approvals = [newApproval, ...data.approvals.filter(a => a.id !== newApproval.id)];
         await saveAllData(data);
         return new Response(JSON.stringify({ success: true, approval: newApproval }), { status: 200, headers });
@@ -6387,6 +6751,10 @@ export default async (req) => {
           created_at: payload.created_at || new Date().toISOString(),
         };
         // 同一人对同一帖子改票，先过滤旧票
+        // 已删除的投票、或已删除审批单下迟到的投票，都不再写回
+        if (isDeleted(data, newVote.id) || isDeleted(data, newVote.approval_id)) {
+          return new Response(JSON.stringify({ success: true, vote: newVote, skipped: true }), { status: 200, headers });
+        }
         data.votes = [
           newVote,
           ...data.votes.filter(v => !(v.approval_id === newVote.approval_id && v.voter_id === newVote.voter_id))
@@ -6407,6 +6775,10 @@ export default async (req) => {
           id: payload.id || `c_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
           created_at: payload.created_at || new Date().toISOString(),
         };
+        // 已删除的留言、或已删除审批单下迟到的留言，都不再写回
+        if (isDeleted(data, newComment.id) || isDeleted(data, newComment.approval_id)) {
+          return new Response(JSON.stringify({ success: true, comment: newComment, skipped: true }), { status: 200, headers });
+        }
         data.comments = [...data.comments, newComment];
         await saveAllData(data);
         return new Response(JSON.stringify({ success: true, comment: newComment }), { status: 200, headers });
@@ -6418,9 +6790,72 @@ export default async (req) => {
           id: payload.id || `g_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
           created_at: payload.created_at || new Date().toISOString(),
         };
+        if (isDeleted(data, newGoodItem.id)) {
+          return new Response(JSON.stringify({ success: true, goodItem: newGoodItem, skipped: true }), { status: 200, headers });
+        }
         data.goodItems = [newGoodItem, ...data.goodItems.filter(g => g.id !== newGoodItem.id)];
         await saveAllData(data);
         return new Response(JSON.stringify({ success: true, goodItem: newGoodItem }), { status: 200, headers });
+      }
+
+      // 删除本人发布的审批单：级联清理该单的投票与讨论，避免留下孤儿数据
+      if (action === 'delete_approval') {
+        const id = payload?.id;
+        const userId = payload?.userId;
+        const target = data.approvals.find(a => a.id === id);
+        if (!target) {
+          // 幂等：云端已无此条（创建请求迟到 / 其他设备已删），仍登记墓碑防止被复活
+          markDeleted(data, id);
+          await saveAllData(data);
+          return new Response(JSON.stringify({ success: true, deleted: id, alreadyGone: true }), { status: 200, headers });
+        }
+        if (!userId || target.creator_id !== userId) {
+          return new Response(JSON.stringify({ success: false, error: '只能删除自己发布的内容' }), { status: 403, headers });
+        }
+        markDeleted(data, id);
+        data.approvals = data.approvals.filter(a => a.id !== id);
+        data.votes = data.votes.filter(v => v.approval_id !== id);
+        data.comments = data.comments.filter(c => c.approval_id !== id);
+        await saveAllData(data);
+        return new Response(JSON.stringify({ success: true, deleted: id }), { status: 200, headers });
+      }
+
+      // 删除本人发布的好物分享
+      if (action === 'delete_good_item') {
+        const id = payload?.id;
+        const userId = payload?.userId;
+        const target = data.goodItems.find(g => g.id === id);
+        if (!target) {
+          markDeleted(data, id);
+          await saveAllData(data);
+          return new Response(JSON.stringify({ success: true, deleted: id, alreadyGone: true }), { status: 200, headers });
+        }
+        if (!userId || target.creator_id !== userId) {
+          return new Response(JSON.stringify({ success: false, error: '只能删除自己发布的内容' }), { status: 403, headers });
+        }
+        markDeleted(data, id);
+        data.goodItems = data.goodItems.filter(g => g.id !== id);
+        await saveAllData(data);
+        return new Response(JSON.stringify({ success: true, deleted: id }), { status: 200, headers });
+      }
+
+      // 删除本人发布的讨论留言
+      if (action === 'delete_comment') {
+        const id = payload?.id;
+        const userId = payload?.userId;
+        const target = data.comments.find(c => c.id === id);
+        if (!target) {
+          markDeleted(data, id);
+          await saveAllData(data);
+          return new Response(JSON.stringify({ success: true, deleted: id, alreadyGone: true }), { status: 200, headers });
+        }
+        if (!userId || target.user_id !== userId) {
+          return new Response(JSON.stringify({ success: false, error: '只能删除自己发布的留言' }), { status: 403, headers });
+        }
+        markDeleted(data, id);
+        data.comments = data.comments.filter(c => c.id !== id);
+        await saveAllData(data);
+        return new Response(JSON.stringify({ success: true, deleted: id }), { status: 200, headers });
       }
 
       return new Response(JSON.stringify({ success: false, error: 'Unknown action' }), { status: 400, headers });
@@ -6654,8 +7089,84 @@ function generateSmartRecommendation({ title, price, category, reason, alternati
 
   return { verdict, reasons: finalReasons };
 }
-
 ```
 
 ---
 
+
+---
+
+## src/components/ConfirmDeleteModal.jsx
+
+```jsx
+import React from 'react';
+import { X, Trash2, AlertTriangle } from 'lucide-react';
+
+/**
+ * 通用删除确认弹窗
+ * 删除是不可逆操作，统一用二次确认拦一道，避免误触。
+ */
+export default function ConfirmDeleteModal({
+  title = '确定要删除吗？',
+  message = '删除后将立即从你和所有人的页面上消失，且无法恢复。',
+  detail = '',
+  loading = false,
+  onConfirm,
+  onCancel,
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/40 backdrop-blur-xs animate-in fade-in duration-200"
+      onClick={loading ? undefined : onCancel}
+    >
+      <div
+        className="relative w-full max-w-sm bg-white rounded-3xl p-6 shadow-2xl border border-rose-100"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button
+          onClick={onCancel}
+          disabled={loading}
+          className="absolute top-4 right-4 p-2 text-slate-400 hover:text-slate-600 rounded-full hover:bg-slate-100 transition disabled:opacity-40"
+        >
+          <X className="w-5 h-5" />
+        </button>
+
+        <div className="flex items-center gap-2.5 mb-4">
+          <div className="w-10 h-10 rounded-2xl bg-rose-100 flex items-center justify-center text-rose-600 shrink-0">
+            <AlertTriangle className="w-5 h-5" />
+          </div>
+          <div className="min-w-0">
+            <h3 className="text-base font-bold text-slate-800">{title}</h3>
+            <p className="text-[11px] text-slate-500 mt-0.5">此操作不可撤销</p>
+          </div>
+        </div>
+
+        <p className="text-xs text-slate-600 leading-relaxed mb-2">{message}</p>
+        {detail && (
+          <div className="bg-slate-50 border border-slate-100 rounded-xl px-3 py-2 mb-4 text-xs text-slate-700 break-words">
+            {detail}
+          </div>
+        )}
+
+        <div className="flex items-center gap-2 mt-5">
+          <button
+            onClick={onCancel}
+            disabled={loading}
+            className="flex-1 py-2.5 rounded-xl text-xs font-bold text-slate-600 bg-slate-100 hover:bg-slate-200 transition disabled:opacity-50 cursor-pointer"
+          >
+            再想想
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={loading}
+            className="flex-1 py-2.5 rounded-xl text-xs font-bold text-white bg-rose-500 hover:bg-rose-600 transition disabled:opacity-50 flex items-center justify-center gap-1.5 active:scale-95 cursor-pointer"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+            <span>{loading ? '删除中...' : '确认删除'}</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+```

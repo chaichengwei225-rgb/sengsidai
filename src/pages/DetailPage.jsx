@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { useRoute, Link } from 'wouter';
+import { useRoute, Link, useLocation } from 'wouter';
 import { 
   ArrowLeft, Clock, ThumbsUp, ThumbsDown, Eye, Share2, 
   MessageSquare, Sparkles, AlertCircle, CheckCircle2, XCircle, Send, UserCheck, ShieldAlert,
-  Bot, Tag
+  Bot, Tag, Trash2
 } from 'lucide-react';
 import CountdownTimer from '../components/CountdownTimer';
 import ShareModal from '../components/ShareModal';
@@ -14,8 +14,10 @@ import { getSupabase } from '../lib/supabase';
 import { autoSettleApproval, calculateApprovalTally } from '../lib/settle';
 import { 
   syncFromCloud, getCachedApprovals, getCachedVotes, 
-  getCachedComments, submitVote, submitComment, updateApproval 
+  getCachedComments, submitVote, submitComment, updateApproval,
+  deleteApproval, deleteComment 
 } from '../lib/cloudStore';
+import ConfirmDeleteModal from '../components/ConfirmDeleteModal';
 import confetti from 'canvas-confetti';
 
 export default function DetailPage() {
@@ -23,12 +25,15 @@ export default function DetailPage() {
   const approvalId = params?.id;
 
   const currentUser = getCurrentUser();
+  const [, setLocation] = useLocation();
 
   const [approval, setApproval] = useState(null);
   const [votes, setVotes] = useState([]);
   const [comments, setComments] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showShareModal, setShowShareModal] = useState(false);
+  const [pendingDelete, setPendingDelete] = useState(null);
+  const [deleting, setDeleting] = useState(false);
 
   // 投票前置选项：是否已拥有该物品（null | true | false）
   const [ownsItem, setOwnsItem] = useState(null);
@@ -168,6 +173,30 @@ export default function DetailPage() {
     return votes.find(v => v.voter_id === currentUser.id);
   }, [votes, currentUser.id]);
 
+  // 删除本人发布的内容（审批单 / 讨论留言）
+  const handleConfirmDelete = async () => {
+    if (!pendingDelete || deleting) return;
+    const target = pendingDelete;
+    setDeleting(true);
+    const res = target.type === 'approval'
+      ? await deleteApproval(target.id, currentUser.id)
+      : await deleteComment(target.id, currentUser.id);
+    setDeleting(false);
+    setPendingDelete(null);
+    if (!res.success) {
+      window.alert(res.error);
+      return;
+    }
+    if (!res.cloudSynced) {
+      window.alert(res.warning || '已从本机删除，但云端同步暂时失败，其他设备可能仍能看到，请稍后重试。');
+    }
+    if (target.type === 'approval') {
+      setLocation('/');
+    } else {
+      setComments(prev => prev.filter(c => c.id !== target.id));
+    }
+  };
+
   // 提交投票
   const handleVoteSubmit = async (e) => {
     e.preventDefault();
@@ -306,15 +335,27 @@ export default function DetailPage() {
           <span>返回广场大厅</span>
         </Link>
 
-        <button
-          onClick={() => {
-            setShowShareModal(true);
-          }}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-100 hover:bg-amber-200/80 text-amber-800 font-bold text-xs rounded-xl transition shadow-2xs active:scale-95"
-        >
-          <Share2 className="w-3.5 h-3.5" />
-          <span>分享审批群 / 劝退口令</span>
-        </button>
+        <div className="flex items-center gap-2">
+          {isCreator && (
+            <button
+              onClick={() => setPendingDelete({ type: 'approval', id: approval.id, title: approval.title })}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-600 font-bold text-xs rounded-xl transition active:scale-95 cursor-pointer"
+              title="删除我发布的这条审批"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>删除</span>
+            </button>
+          )}
+          <button
+            onClick={() => {
+              setShowShareModal(true);
+            }}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-100 hover:bg-amber-200/80 text-amber-800 font-bold text-xs rounded-xl transition shadow-2xs active:scale-95"
+          >
+            <Share2 className="w-3.5 h-3.5" />
+            <span>分享审批群 / 劝退口令</span>
+          </button>
+        </div>
       </div>
 
       {/* 核心商品卡片 */}
@@ -811,9 +852,20 @@ export default function DetailPage() {
               <div key={c.id || c.created_at} className="bg-amber-50/40 p-3 rounded-2xl border border-amber-100/60 text-xs animate-fadeIn">
                 <div className="flex items-center justify-between text-slate-500 mb-1 text-[11px]">
                   <span className="font-bold text-slate-700">@{c.user_nickname}</span>
-                  <span className="font-mono text-[10px]">
-                    {new Date(c.created_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="font-mono text-[10px]">
+                      {new Date(c.created_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}
+                    </span>
+                    {c.user_id === currentUser.id && (
+                      <button
+                        onClick={() => setPendingDelete({ type: 'comment', id: c.id, title: c.content })}
+                        className="text-rose-400 hover:text-rose-600 transition cursor-pointer"
+                        title="删除我的留言"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    )}
+                  </div>
                 </div>
                 <div className="text-slate-800">{c.content}</div>
               </div>
@@ -845,6 +897,20 @@ export default function DetailPage() {
         <ShareModal
           approval={approval}
           onClose={() => setShowShareModal(false)}
+        />
+      )}
+
+      {/* 删除确认 */}
+      {pendingDelete && (
+        <ConfirmDeleteModal
+          title={pendingDelete.type === 'approval' ? '删除这条消费审批？' : '删除这条留言？'}
+          message={pendingDelete.type === 'approval'
+            ? '删除后整条审批、所有投票与讨论都会从全网消失，且无法恢复。'
+            : '删除后这条留言会从讨论区消失，且无法恢复。'}
+          detail={pendingDelete.title || ''}
+          loading={deleting}
+          onConfirm={handleConfirmDelete}
+          onCancel={() => setPendingDelete(null)}
         />
       )}
     </div>

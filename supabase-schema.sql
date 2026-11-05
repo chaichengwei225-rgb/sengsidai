@@ -192,6 +192,19 @@ CREATE POLICY "Public can insert good_items" ON good_items FOR INSERT WITH CHECK
 DROP POLICY IF EXISTS "Public can update good_items" ON good_items;
 CREATE POLICY "Public can update good_items" ON good_items FOR UPDATE USING (true);
 
+-- 本人删除自己发布的内容所需的 DELETE 策略
+-- 注意：本项目为免注册匿名架构，身份仅有浏览器 localStorage 里的 creator_id / user_id，
+-- 服务端无法真正鉴权。前端与 Netlify Function 都会比对 id，属「防误删」而非「防恶意」。
+-- 若后续接入登录，应把 USING (true) 改为 auth.uid() = creator_id 之类的强校验。
+DROP POLICY IF EXISTS "Public can delete approvals" ON approvals;
+CREATE POLICY "Public can delete approvals" ON approvals FOR DELETE USING (true);
+
+DROP POLICY IF EXISTS "Public can delete comments" ON comments;
+CREATE POLICY "Public can delete comments" ON comments FOR DELETE USING (true);
+
+DROP POLICY IF EXISTS "Public can delete good_items" ON good_items;
+CREATE POLICY "Public can delete good_items" ON good_items FOR DELETE USING (true);
+
 -- 9. 开启 Realtime 实时数据同步推送
 DO $$
 BEGIN

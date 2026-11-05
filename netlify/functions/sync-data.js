@@ -198,7 +198,37 @@ let memoryState = {
   votes: [...DEFAULT_VOTES],
   comments: [...DEFAULT_COMMENTS],
   goodItems: [...DEFAULT_GOOD_ITEMS],
+  deletedIds: [],
 };
+
+// 云端删除墓碑上限，避免 Blob 无限膨胀
+const MAX_DELETED_IDS = 500;
+
+/**
+ * 归一化历史数据。
+ * 早期版本写入的 Blob 可能缺少 goodItems / comments / votes / deletedIds，
+ * 若不补全，删除与 ?limit= 分支会对 undefined 调用 find / slice 而返回 500。
+ */
+function normalizeData(raw) {
+  const safe = raw && typeof raw === 'object' ? raw : {};
+  return {
+    ...safe,
+    approvals: Array.isArray(safe.approvals) ? safe.approvals : [...DEFAULT_APPROVALS],
+    votes: Array.isArray(safe.votes) ? safe.votes : [...DEFAULT_VOTES],
+    comments: Array.isArray(safe.comments) ? safe.comments : [...DEFAULT_COMMENTS],
+    goodItems: Array.isArray(safe.goodItems) ? safe.goodItems : [...DEFAULT_GOOD_ITEMS],
+    deletedIds: Array.isArray(safe.deletedIds) ? safe.deletedIds : [],
+  };
+}
+
+function isDeleted(data, id) {
+  return Boolean(id) && data.deletedIds.includes(id);
+}
+
+function markDeleted(data, id) {
+  if (!id) return;
+  data.deletedIds = [...data.deletedIds.filter(x => x !== id), id].slice(-MAX_DELETED_IDS);
+}
 
 function getBlobStore() {
   try {
@@ -210,36 +240,35 @@ function getBlobStore() {
 
 async function loadAllData() {
   const store = getBlobStore();
-  if (!store) return memoryState;
+  if (!store) return normalizeData(memoryState);
 
   try {
     const raw = await store.get('all_data', { type: 'json' });
     if (raw && typeof raw === 'object' && Array.isArray(raw.approvals)) {
+      const data = normalizeData(raw);
       // 自动修复旧的好物图片链接
-      if (Array.isArray(raw.goodItems)) {
-        raw.goodItems = raw.goodItems.map(item => {
-          if (item.id === 'g-001' || (item.title && item.title.includes('办公椅'))) {
-            if (!item.image_url || item.image_url.includes('1580481077197') || item.image_url.includes('unsplash.com')) {
-              return { ...item, image_url: '/office-chair.jpg' };
-            }
+      data.goodItems = data.goodItems.map(item => {
+        if (item.id === 'g-001' || (item.title && item.title.includes('办公椅'))) {
+          if (!item.image_url || item.image_url.includes('1580481077197') || item.image_url.includes('unsplash.com')) {
+            return { ...item, image_url: '/office-chair.jpg' };
           }
-          return item;
-        });
-      }
-      return raw;
+        }
+        return item;
+      });
+      return data;
     }
     // 初次使用，写入初始数据
-    const initData = {
+    const initData = normalizeData({
       approvals: DEFAULT_APPROVALS,
       votes: DEFAULT_VOTES,
       comments: DEFAULT_COMMENTS,
       goodItems: DEFAULT_GOOD_ITEMS,
-    };
+    });
     await store.setJSON('all_data', initData);
     return initData;
   } catch (err) {
     console.warn('[SyncData] Netlify Blob read error, fallback to memory:', err);
-    return memoryState;
+    return normalizeData(memoryState);
   }
 }
 
@@ -284,14 +313,18 @@ export default async (req) => {
         // req.url 异常时退化为全量，不影响原有调用方
       }
 
+      // deletedIds 是服务端内部墓碑，不暴露给前端 / Coze，避免无谓增大响应体
+      const publicData = { ...data };
+      delete publicData.deletedIds;
+
       const payload = limit
         ? {
-            approvals: data.approvals.slice(0, limit),
-            votes: data.votes.slice(0, limit * 20),
-            comments: data.comments.slice(0, limit * 20),
-            goodItems: data.goodItems.slice(0, limit),
+            approvals: publicData.approvals.slice(0, limit),
+            votes: publicData.votes.slice(0, limit * 20),
+            comments: publicData.comments.slice(0, limit * 20),
+            goodItems: publicData.goodItems.slice(0, limit),
           }
-        : data;
+        : publicData;
 
       return new Response(JSON.stringify({ success: true, data: payload }), { status: 200, headers });
     }
@@ -309,6 +342,9 @@ export default async (req) => {
           created_at: payload.created_at || new Date().toISOString(),
           status: payload.status || 'pending',
         };
+        if (isDeleted(data, newApproval.id)) {
+          return new Response(JSON.stringify({ success: true, approval: newApproval, skipped: true }), { status: 200, headers });
+        }
         data.approvals = [newApproval, ...data.approvals.filter(a => a.id !== newApproval.id)];
         await saveAllData(data);
         return new Response(JSON.stringify({ success: true, approval: newApproval }), { status: 200, headers });
@@ -327,6 +363,10 @@ export default async (req) => {
           created_at: payload.created_at || new Date().toISOString(),
         };
         // 同一人对同一帖子改票，先过滤旧票
+        // 已删除的投票、或已删除审批单下迟到的投票，都不再写回
+        if (isDeleted(data, newVote.id) || isDeleted(data, newVote.approval_id)) {
+          return new Response(JSON.stringify({ success: true, vote: newVote, skipped: true }), { status: 200, headers });
+        }
         data.votes = [
           newVote,
           ...data.votes.filter(v => !(v.approval_id === newVote.approval_id && v.voter_id === newVote.voter_id))
@@ -347,6 +387,10 @@ export default async (req) => {
           id: payload.id || `c_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
           created_at: payload.created_at || new Date().toISOString(),
         };
+        // 已删除的留言、或已删除审批单下迟到的留言，都不再写回
+        if (isDeleted(data, newComment.id) || isDeleted(data, newComment.approval_id)) {
+          return new Response(JSON.stringify({ success: true, comment: newComment, skipped: true }), { status: 200, headers });
+        }
         data.comments = [...data.comments, newComment];
         await saveAllData(data);
         return new Response(JSON.stringify({ success: true, comment: newComment }), { status: 200, headers });
@@ -358,9 +402,72 @@ export default async (req) => {
           id: payload.id || `g_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
           created_at: payload.created_at || new Date().toISOString(),
         };
+        if (isDeleted(data, newGoodItem.id)) {
+          return new Response(JSON.stringify({ success: true, goodItem: newGoodItem, skipped: true }), { status: 200, headers });
+        }
         data.goodItems = [newGoodItem, ...data.goodItems.filter(g => g.id !== newGoodItem.id)];
         await saveAllData(data);
         return new Response(JSON.stringify({ success: true, goodItem: newGoodItem }), { status: 200, headers });
+      }
+
+      // 删除本人发布的审批单：级联清理该单的投票与讨论，避免留下孤儿数据
+      if (action === 'delete_approval') {
+        const id = payload?.id;
+        const userId = payload?.userId;
+        const target = data.approvals.find(a => a.id === id);
+        if (!target) {
+          // 幂等：云端已无此条（创建请求迟到 / 其他设备已删），仍登记墓碑防止被复活
+          markDeleted(data, id);
+          await saveAllData(data);
+          return new Response(JSON.stringify({ success: true, deleted: id, alreadyGone: true }), { status: 200, headers });
+        }
+        if (!userId || target.creator_id !== userId) {
+          return new Response(JSON.stringify({ success: false, error: '只能删除自己发布的内容' }), { status: 403, headers });
+        }
+        markDeleted(data, id);
+        data.approvals = data.approvals.filter(a => a.id !== id);
+        data.votes = data.votes.filter(v => v.approval_id !== id);
+        data.comments = data.comments.filter(c => c.approval_id !== id);
+        await saveAllData(data);
+        return new Response(JSON.stringify({ success: true, deleted: id }), { status: 200, headers });
+      }
+
+      // 删除本人发布的好物分享
+      if (action === 'delete_good_item') {
+        const id = payload?.id;
+        const userId = payload?.userId;
+        const target = data.goodItems.find(g => g.id === id);
+        if (!target) {
+          markDeleted(data, id);
+          await saveAllData(data);
+          return new Response(JSON.stringify({ success: true, deleted: id, alreadyGone: true }), { status: 200, headers });
+        }
+        if (!userId || target.creator_id !== userId) {
+          return new Response(JSON.stringify({ success: false, error: '只能删除自己发布的内容' }), { status: 403, headers });
+        }
+        markDeleted(data, id);
+        data.goodItems = data.goodItems.filter(g => g.id !== id);
+        await saveAllData(data);
+        return new Response(JSON.stringify({ success: true, deleted: id }), { status: 200, headers });
+      }
+
+      // 删除本人发布的讨论留言
+      if (action === 'delete_comment') {
+        const id = payload?.id;
+        const userId = payload?.userId;
+        const target = data.comments.find(c => c.id === id);
+        if (!target) {
+          markDeleted(data, id);
+          await saveAllData(data);
+          return new Response(JSON.stringify({ success: true, deleted: id, alreadyGone: true }), { status: 200, headers });
+        }
+        if (!userId || target.user_id !== userId) {
+          return new Response(JSON.stringify({ success: false, error: '只能删除自己发布的留言' }), { status: 403, headers });
+        }
+        markDeleted(data, id);
+        data.comments = data.comments.filter(c => c.id !== id);
+        await saveAllData(data);
+        return new Response(JSON.stringify({ success: true, deleted: id }), { status: 200, headers });
       }
 
       return new Response(JSON.stringify({ success: false, error: 'Unknown action' }), { status: 400, headers });

@@ -1,11 +1,11 @@
 import React from 'react';
 import { Link } from 'wouter';
-import { ThumbsUp, ThumbsDown, Share2, Sparkles, Bot, ArrowRight } from 'lucide-react';
+import { ThumbsUp, ThumbsDown, Share2, Sparkles, Bot, ArrowRight, Trash2 } from 'lucide-react';
 import CountdownTimer from './CountdownTimer';
 import { ROAST_MESSAGES } from '../lib/constants';
 import { calculateApprovalTally } from '../lib/settle';
 
-export default function ApprovalCard({ approval, votes = [], onShare, isOwner = false }) {
+export default function ApprovalCard({ approval, votes = [], onShare, isOwner = false, onDelete }) {
   // 计算综合票数分解
   const tally = calculateApprovalTally(approval, votes);
   const totalDecisive = tally.humanApprove + tally.humanReject;
@@ -171,6 +171,17 @@ export default function ApprovalCard({ approval, votes = [], onShare, isOwner = 
             <Share2 className="w-3.5 h-3.5" />
             <span>求劝退</span>
           </button>
+
+          {isOwner && onDelete && (
+            <button
+              onClick={() => onDelete(approval)}
+              className="flex items-center gap-1 text-xs text-rose-500 hover:text-rose-700 py-1.5 px-2.5 rounded-xl hover:bg-rose-50 transition cursor-pointer shrink-0"
+              title="删除我发布的这条审批"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>删除</span>
+            </button>
+          )}
 
           <Link
             href={`/approval/${approval.id}`}
