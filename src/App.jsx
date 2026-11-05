@@ -58,13 +58,15 @@ export default function App() {
   };
 
   return (
+    // Router 必须包住 Navbar / BottomNav：它们的 Link 与 useLocation 依赖 router.hook，
+    // 放在 Router 外面会退回默认的 history hook，导致点击导航只改路径不改 hash，页面不切换。
+    <Router hook={useHashLocation}>
     <div className="min-h-screen bg-[#faf8f5] flex flex-col font-sans selection:bg-amber-200 selection:text-amber-900 text-slate-800">
       {/* 顶部导航 */}
       <Navbar onOpenConfig={() => setShowConfig(true)} />
 
       {/* 主体内容 */}
       <main className="flex-1 max-w-4xl w-full mx-auto px-4 py-6">
-        <Router hook={useHashLocation}>
         <Switch>
           <Route path="/">
             <SquarePage onOpenConfig={() => setShowConfig(true)} />
@@ -88,7 +90,6 @@ export default function App() {
             <SquarePage onOpenConfig={() => setShowConfig(true)} />
           </Route>
         </Switch>
-        </Router>
       </main>
 
       {/* 移动端底部悬浮 Dock */}
@@ -123,5 +124,6 @@ export default function App() {
         <ConfigModal onClose={() => setShowConfig(false)} />
       )}
     </div>
+    </Router>
   );
 }
