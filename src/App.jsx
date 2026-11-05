@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Route, Switch } from 'wouter';
+import { Router, Route, Switch } from 'wouter';
 import Navbar from './components/Navbar';
 import BottomNav from './components/BottomNav';
 import ConfigModal from './components/ConfigModal';
@@ -42,6 +42,8 @@ export default function App() {
 
       {/* 主体内容 */}
       <main className="flex-1 max-w-4xl w-full mx-auto px-4 py-6">
+        {/* GitHub Pages 部署在 /<repo>/ 子路径下时，wouter 需要剥离 base 前缀才能正确匹配路由 */}
+        <Router base={import.meta.env.BASE_URL.replace(/\/$/, '')}>
         <Switch>
           <Route path="/">
             <SquarePage onOpenConfig={() => setShowConfig(true)} />
@@ -65,6 +67,7 @@ export default function App() {
             <SquarePage onOpenConfig={() => setShowConfig(true)} />
           </Route>
         </Switch>
+        </Router>
       </main>
 
       {/* 移动端底部悬浮 Dock */}
