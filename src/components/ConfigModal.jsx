@@ -201,7 +201,7 @@ export default function ConfigModal({ onClose }) {
               }`}>
                 <div className="font-bold">
                   {glmResult.ok
-                    ? `✅ GLM 已接通（${glmResult.model || 'glm-4.7-flash'}）`
+                    ? `✅ GLM 已接通（${glmResult.model || 'glm-4-flash-250414'}）`
                     : '⚠️ 当前仍在用规则引擎，GLM 未生效'}
                 </div>
                 {glmResult.reason && (

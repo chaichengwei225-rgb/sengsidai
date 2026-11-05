@@ -207,7 +207,7 @@ export default function AiVerdictCard({ approval, votes = [], onUpdateApproval }
         }`}>
           {aiData.source === 'glm' ? <Sparkles className="w-3 h-3" /> : <Bot className="w-3 h-3" />}
           {aiData.source === 'glm'
-            ? `GLM 实时推理 · ${glmModel || 'glm-4.7-flash'}`
+            ? `GLM 实时推理 · ${glmModel || 'glm-4-flash-250414'}`
             : '本地规则引擎 · 尚未接入大模型'}
         </span>
         {engineHint && (

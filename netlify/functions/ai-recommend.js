@@ -9,8 +9,13 @@
 // 5. API Key 只从服务端环境变量或请求体里的自定义 Key 读取，绝不能放进 VITE_ 前端变量。
 
 const DEFAULT_ENDPOINT = "https://open.bigmodel.cn/api/paas/v4/chat/completions";
-const DEFAULT_MODEL = "glm-4.7-flash"; // 智谱官方免费文本模型，见 docs.bigmodel.cn 模型概览
-const LLM_TIMEOUT_MS = 12000;
+// 模型选型（2026-11-05 实测）：glm-4.7-flash 虽是较新的免费模型，但免费通道频繁返回
+// 429「该模型当前访问量过大」，且它带思维链，token 可能被 reasoning_content 吃光导致
+// content 为空、JSON 解析失败。glm-4-flash-250414 同为官方免费文本模型，无思维链、
+// 响应干净、连续调用稳定，故设为默认。需要更强模型可在 Netlify 后台用 AI_MODEL 覆盖。
+const DEFAULT_MODEL = "glm-4-flash-250414";
+const LLM_TIMEOUT_MS = 7000; // Netlify 同步 Function 默认超时约 10s，留出重试余量
+const RETRY_DELAY_MS = 500;
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -68,6 +73,7 @@ async function callGlm({ apiKey, endpoint, model, prompt }) {
         model,
         stream: false,
         temperature: 0.7,
+        max_tokens: 1024,
         messages: [
           {
             role: "system",
@@ -88,6 +94,7 @@ async function callGlm({ apiKey, endpoint, model, prompt }) {
       }
       return {
         ok: false,
+        retryable: resp.status === 429 || resp.status >= 500,
         reason: `上游返回 HTTP ${resp.status}${detail ? "：" + safeError(detail, apiKey) : ""}`,
       };
     }
@@ -125,6 +132,15 @@ async function callGlm({ apiKey, endpoint, model, prompt }) {
     }
 
     return { ok: true, verdict, reasons, model: raw?.model || model };
+  } catch (e) {
+    const isTimeout = e?.name === "AbortError";
+    return {
+      ok: false,
+      retryable: true,
+      reason: isTimeout
+        ? `GLM 请求超时（超过 ${LLM_TIMEOUT_MS / 1000} 秒）`
+        : `GLM 调用异常：${safeError(e?.message, apiKey)}`,
+    };
   } finally {
     clearTimeout(timer);
   }
@@ -224,7 +240,12 @@ exports.handler = async function (event) {
 2. reasons 为 2 到 3 条简明精辟的理由（每条40字以内），切中要害。`;
 
     try {
-      const llm = await callGlm({ apiKey, endpoint, model, prompt });
+      let llm = await callGlm({ apiKey, endpoint, model, prompt });
+      // 429 / 5xx / 超时是偶发故障，短等后重试一次；401/400 这类确定性错误直接回退，不浪费时间
+      if (!llm.ok && llm.retryable) {
+        await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+        llm = await callGlm({ apiKey, endpoint, model, prompt });
+      }
       if (llm.ok) {
         return json(200, {
           configured: true,
