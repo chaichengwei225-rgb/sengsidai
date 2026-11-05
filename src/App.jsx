@@ -1,17 +1,32 @@
-import React, { useState, useEffect } from 'react';
-import { Router, Route, Switch, useBrowserLocation } from 'wouter';
+import React, { useState, useEffect, useCallback } from 'react';
+import { Router, Route, Switch } from 'wouter';
 
 // GitHub Pages 部署在 /<repo>/ 子路径时，浏览器 location 会带上这个前缀，
-// 而路由表是按 /approval/:id 这种根路径写的，所以这里显式剥离。
+// 而路由表是按 /approval/:id 这种根路径写的。
+// 注意：wouter v3 的 <Router base> 只影响链接生成，不会剥离 useLocation 的路径，
+// 所以这里自己实现 location hook 显式做剥离。
 const ROUTER_BASE = (import.meta.env.BASE_URL || '/').replace(/\/$/, '');
 const useBaseLocation = () => {
-  const [location, navigate] = useBrowserLocation();
+  const [path, setPath] = useState(() =>
+    typeof window === 'undefined' ? '/' : window.location.pathname
+  );
+  useEffect(() => {
+    const onPop = () => setPath(window.location.pathname);
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
+  const navigate = useCallback((to, opts = {}) => {
+    const full = ROUTER_BASE + to;
+    if (opts.replace) window.history.replaceState(null, '', full);
+    else window.history.pushState(null, '', full);
+    setPath(window.location.pathname);
+    window.scrollTo(0, 0);
+  }, []);
   const stripped =
-    ROUTER_BASE && location.startsWith(ROUTER_BASE)
-      ? location.slice(ROUTER_BASE.length) || '/'
-      : location;
-  const nav = (to, opts) => navigate(ROUTER_BASE + to, opts);
-  return [stripped, nav];
+    ROUTER_BASE && path.startsWith(ROUTER_BASE)
+      ? path.slice(ROUTER_BASE.length) || '/'
+      : path;
+  return [stripped, navigate];
 };
 import Navbar from './components/Navbar';
 import BottomNav from './components/BottomNav';
