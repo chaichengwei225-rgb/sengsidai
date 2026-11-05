@@ -24,11 +24,10 @@ const corsHeaders = {
 };
 
 function json(statusCode, payload) {
-  return {
-    statusCode,
+  return new Response(JSON.stringify(payload), {
+    status: statusCode,
     headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" },
-    body: JSON.stringify(payload),
-  };
+  });
 }
 
 // 脱敏：截断 + 抹掉任何形似密钥 / Bearer 串，防止把 Key 回显到浏览器。
@@ -146,17 +145,18 @@ async function callGlm({ apiKey, endpoint, model, prompt }) {
   }
 }
 
-exports.handler = async function (event) {
-  if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 200, headers: corsHeaders, body: "ok" };
+// 统一的 Web API handler：Netlify（ESM function）与 Vercel（api/ 转发）共用同一份实现
+export default async function handler(request) {
+  if (request.method === "OPTIONS") {
+    return new Response("ok", { status: 200, headers: corsHeaders });
   }
-  if (event.httpMethod !== "POST") {
+  if (request.method !== "POST") {
     return json(405, { error: "Method Not Allowed" });
   }
 
   let body = {};
   try {
-    body = JSON.parse(event.body || "{}");
+    body = JSON.parse((await request.text()) || "{}");
   } catch (e) {
     body = {};
   }
