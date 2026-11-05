@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>👝</text></svg>" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>省思袋 👝 - 消费冷静期审批平台</title>
+    <meta name="description" content="省思袋：帮年轻人对抗冲动消费的网站。用户把想买的东西提交为一笔消费审批，由网友或朋友投票决定买还是不买，核心是给冲动消费加一个 24 小时冷静期。" />
+    <style>
+      /* 强制彻底隐藏 Netlify HUD 与第三方注入徽章，避免遮挡移动端底部导航 */
+      #nl-badge-frame,
+      #nl-hud-frame,
+      iframe[id^="nl-"],
+      iframe[src*="netlify"],
+      iframe[srcdoc*="Powered by"],
+      [data-netlify-site-id],
+      .netlify-badge,
+      #netlify-badge {
+        display: none !important;
+        visibility: hidden !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
+        width: 0 !important;
+        height: 0 !important;
+        position: absolute !important;
+        left: -9999px !important;
+        top: -9999px !important;
+        z-index: -9999 !important;
+      }
+    </style>
+    <script>
+      (function() {
+        function removeBadge() {
+          var frames = document.querySelectorAll('#nl-badge-frame, #nl-hud-frame, iframe[id^="nl-"]');
+          for (var i = 0; i < frames.length; i++) {
+            frames[i].remove();
+          }
+          var hudScript = document.querySelector('script[src*="hud"], script[data-nf-variant]');
+          if (hudScript) {
+            delete hudScript.dataset.nfVariant;
+            hudScript.remove();
+          }
+        }
+        removeBadge();
+        if (typeof MutationObserver !== 'undefined') {
+          var obs = new MutationObserver(removeBadge);
+          obs.observe(document.documentElement, { childList: true, subtree: true });
+        }
+        window.addEventListener('DOMContentLoaded', removeBadge);
+        window.addEventListener('load', removeBadge);
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

@@ -1,0 +1,4 @@
+project_id = "wallet-wait"
+
+[functions.ai-recommend]
+verify_jwt = false
