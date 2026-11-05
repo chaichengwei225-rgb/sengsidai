@@ -270,7 +270,30 @@ export default async (req) => {
   try {
     if (req.method === 'GET') {
       const data = await loadAllData();
-      return new Response(JSON.stringify({ success: true, data }), { status: 200, headers });
+
+      // 可选参数 ?limit=N：供 Coze 等第三方插件限制响应体大小。
+      // 不传时保持全量返回，前端广场 / 战绩 / 详情页行为完全不变。
+      let limit = null;
+      try {
+        const raw = new URL(req.url).searchParams.get('limit');
+        if (raw !== null) {
+          const n = parseInt(raw, 10);
+          if (Number.isFinite(n) && n > 0) limit = Math.min(200, n);
+        }
+      } catch {
+        // req.url 异常时退化为全量，不影响原有调用方
+      }
+
+      const payload = limit
+        ? {
+            approvals: data.approvals.slice(0, limit),
+            votes: data.votes.slice(0, limit * 20),
+            comments: data.comments.slice(0, limit * 20),
+            goodItems: data.goodItems.slice(0, limit),
+          }
+        : data;
+
+      return new Response(JSON.stringify({ success: true, data: payload }), { status: 200, headers });
     }
 
     if (req.method === 'POST') {

@@ -4,7 +4,7 @@
 
 ## package.json
 
-`json
+```json
 {
   "name": "wallet-wait",
   "private": true,
@@ -37,13 +37,13 @@
   }
 }
 
-`
+```
 
 ---
 
 ## vite.config.js
 
-`javascript
+```javascript
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
@@ -56,13 +56,13 @@ export default defineConfig({
   ],
 })
 
-`
+```
 
 ---
 
 ## index.html
 
-`html
+```html
 <!doctype html>
 <html lang="zh-CN">
   <head>
@@ -122,13 +122,13 @@ export default defineConfig({
   </body>
 </html>
 
-`
+```
 
 ---
 
 ## src/main.jsx
 
-`javascript
+```javascript
 import React, { StrictMode, Component } from 'react';
 import { createRoot } from 'react-dom/client';
 import './index.css';
@@ -195,13 +195,13 @@ createRoot(document.getElementById('root')).render(
   </StrictMode>,
 );
 
-`
+```
 
 ---
 
 ## src/App.jsx
 
-`javascript
+```javascript
 import React, { useState, useEffect } from 'react';
 import { Route, Switch } from 'wouter';
 import Navbar from './components/Navbar';
@@ -306,13 +306,13 @@ export default function App() {
   );
 }
 
-`
+```
 
 ---
 
 ## src/index.css
 
-`css
+```css
 @import "tailwindcss";
 
 @layer base {
@@ -403,13 +403,13 @@ iframe[srcdoc*="Powered by"],
   z-index: -9999 !important;
 }
 
-`
+```
 
 ---
 
 ## src/lib/constants.js
 
-`javascript
+```javascript
 // 分类列表
 export const CATEGORIES = [
   { id: 'all', name: '全部', icon: '✨' },
@@ -502,13 +502,13 @@ export const QUICK_REASONS = {
   ]
 };
 
-`
+```
 
 ---
 
 ## src/lib/user.js
 
-`javascript
+```javascript
 import { NICKNAME_ADJECTIVES, NICKNAME_NOUNS } from './constants';
 
 const USER_STORAGE_KEY = 'wallet_wait_user_profile';
@@ -607,13 +607,13 @@ export function resetUserProfile() {
   return newUser;
 }
 
-`
+```
 
 ---
 
 ## src/lib/settle.js
 
-`javascript
+```javascript
 import { getSupabase } from './supabase';
 
 /**
@@ -763,13 +763,13 @@ export async function autoSettleApproval(approval, votes = []) {
   return { ...approval, status: result };
 }
 
-`
+```
 
 ---
 
 ## src/lib/cloudStore.js
 
-`javascript
+```javascript
 import { getSupabase, isSupabaseConfigured } from './supabase';
 import { INITIAL_SEED_APPROVALS, INITIAL_SEED_VOTES } from './seedFallback';
 import { INITIAL_GOOD_ITEMS } from './goodItemsFallback';
@@ -1143,13 +1143,13 @@ export function getCachedGoodItems() {
   return localCache.goodItems;
 }
 
-`
+```
 
 ---
 
 ## src/lib/goodItems.js
 
-`javascript
+```javascript
 import { 
   syncFromCloud, 
   getCachedGoodItems, 
@@ -1193,13 +1193,13 @@ export async function createGoodItem(item) {
   }
 }
 
-`
+```
 
 ---
 
 ## src/lib/goodItemsFallback.js
 
-`javascript
+```javascript
 // 初始好物分享种子数据
 export const INITIAL_GOOD_ITEMS = [
   {
@@ -1256,13 +1256,13 @@ export const INITIAL_GOOD_ITEMS = [
   }
 ];
 
-`
+```
 
 ---
 
 ## src/lib/seedFallback.js
 
-`javascript
+```javascript
 // 离线/未连接数据库时的初始种子数据备份
 export const INITIAL_SEED_APPROVALS = [
   {
@@ -1440,13 +1440,13 @@ export const INITIAL_SEED_VOTES = [
   { approval_id: '33333333-3333-3333-3333-333333333333', voter_id: 'v_25', voter_nickname: '同病相怜同事', type: 'approve', owns_item: true, reason: '加份啵啵咬一咬发泄一下，准了！', created_at: new Date(Date.now() - 30 * 60 * 1000).toISOString() },
 ];
 
-`
+```
 
 ---
 
 ## src/lib/supabase.js
 
-`javascript
+```javascript
 import { createClient } from '@supabase/supabase-js';
 
 // 获取配置：优先环境变量，其次 localStorage
@@ -1507,13 +1507,13 @@ export function isSupabaseConfigured() {
   return Boolean(url && key && url.startsWith('http'));
 }
 
-`
+```
 
 ---
 
 ## src/lib/ai.js
 
-`javascript
+```javascript
 import { getSupabase } from './supabase';
 import { updateApproval } from './cloudStore';
 
@@ -1765,13 +1765,13 @@ export function generateInitialAiAdvice(approval) {
   });
 }
 
-`
+```
 
 ---
 
 ## src/components/Navbar.jsx
 
-`javascript
+```javascript
 import React, { useState, useEffect } from 'react';
 import { Link, useLocation } from 'wouter';
 import { PlusCircle, User, Dices, Edit2, Check, Sparkles, PiggyBank } from 'lucide-react';
@@ -1921,13 +1921,13 @@ export default function Navbar({ onOpenConfig }) {
   );
 }
 
-`
+```
 
 ---
 
 ## src/components/BottomNav.jsx
 
-`javascript
+```javascript
 import React from 'react';
 import { Link, useLocation } from 'wouter';
 import { Compass, Plus, Sparkles, PiggyBank, User } from 'lucide-react';
@@ -1997,13 +1997,13 @@ export default function BottomNav() {
   );
 }
 
-`
+```
 
 ---
 
 ## src/components/ApprovalCard.jsx
 
-`javascript
+```javascript
 import React from 'react';
 import { Link } from 'wouter';
 import { ThumbsUp, ThumbsDown, Share2, Sparkles, Bot, ArrowRight } from 'lucide-react';
@@ -2191,13 +2191,13 @@ export default function ApprovalCard({ approval, votes = [], onShare, isOwner = 
   );
 }
 
-`
+```
 
 ---
 
 ## src/components/AiVerdictCard.jsx
 
-`javascript
+```javascript
 import React, { useState, useEffect } from 'react';
 import { Bot, RefreshCw, Sparkles, AlertTriangle, CheckCircle2, XCircle, HelpCircle } from 'lucide-react';
 import { fetchAiRecommendation, getAiRetryCooldown, recordAiRetryTimestamp } from '../lib/ai';
@@ -2443,13 +2443,13 @@ export default function AiVerdictCard({ approval, votes = [], onUpdateApproval }
   );
 }
 
-`
+```
 
 ---
 
 ## src/components/CountdownTimer.jsx
 
-`javascript
+```javascript
 import React, { useState, useEffect } from 'react';
 import { Clock } from 'lucide-react';
 
@@ -2520,13 +2520,13 @@ export default function CountdownTimer({ deadline, status, onExpire, compact = f
   );
 }
 
-`
+```
 
 ---
 
 ## src/components/ShareModal.jsx
 
-`javascript
+```javascript
 import React, { useState } from 'react';
 import { X, Copy, Check, Share2, Users } from 'lucide-react';
 
@@ -2638,13 +2638,13 @@ ${approval.expected_duration ? `预计使用时间：${approval.expected_duratio
   );
 }
 
-`
+```
 
 ---
 
 ## src/components/ShareGoodItemModal.jsx
 
-`javascript
+```javascript
 import React, { useState } from 'react';
 import { X, Upload, Sparkles, Image, Check, Heart } from 'lucide-react';
 import { getCurrentUser } from '../lib/user';
@@ -2863,13 +2863,13 @@ export default function ShareGoodItemModal({ isOpen, onClose, onCreated }) {
   );
 }
 
-`
+```
 
 ---
 
 ## src/components/ConfigModal.jsx
 
-`javascript
+```javascript
 import React, { useState, useEffect } from 'react';
 import { X, Database, Check, Copy, ExternalLink, RefreshCw, AlertCircle, Sparkles } from 'lucide-react';
 import { getSupabaseCredentials, saveSupabaseCredentials, getSupabase } from '../lib/supabase';
@@ -3065,13 +3065,13 @@ export default function ConfigModal({ onClose }) {
   );
 }
 
-`
+```
 
 ---
 
 ## src/components/OnboardingModal.jsx
 
-`javascript
+```javascript
 import React, { useState } from 'react';
 import { Sparkles, Check, User, Dices } from 'lucide-react';
 import { GENDER_OPTIONS, MBTI_OPTIONS, ZODIAC_OPTIONS } from '../lib/constants';
@@ -3258,13 +3258,13 @@ export default function OnboardingModal({ user, onComplete }) {
   );
 }
 
-`
+```
 
 ---
 
 ## src/pages/SquarePage.jsx
 
-`javascript
+```javascript
 import React, { useState, useEffect, useMemo } from 'react';
 import { Sparkles, Clock, Flame, RefreshCw, Plus } from 'lucide-react';
 import { Link } from 'wouter';
@@ -3585,13 +3585,13 @@ export default function SquarePage({ onOpenConfig }) {
   );
 }
 
-`
+```
 
 ---
 
 ## src/pages/CreatePage.jsx
 
-`javascript
+```javascript
 import React, { useState } from 'react';
 import { useLocation } from 'wouter';
 import { 
@@ -4410,13 +4410,13 @@ export default function CreatePage() {
   );
 }
 
-`
+```
 
 ---
 
 ## src/pages/DetailPage.jsx
 
-`javascript
+```javascript
 import React, { useState, useEffect, useMemo } from 'react';
 import { useRoute, Link } from 'wouter';
 import { 
@@ -5270,13 +5270,13 @@ export default function DetailPage() {
   );
 }
 
-`
+```
 
 ---
 
 ## src/pages/RecordsPage.jsx
 
-`javascript
+```javascript
 import React, { useState, useEffect, useMemo } from 'react';
 import { Link } from 'wouter';
 import { PiggyBank, RefreshCw, Plus, Sparkles, ShieldAlert, CheckCircle2, Clock } from 'lucide-react';
@@ -5553,13 +5553,13 @@ export default function RecordsPage() {
   );
 }
 
-`
+```
 
 ---
 
 ## src/pages/MyPage.jsx
 
-`javascript
+```javascript
 import React, { useState } from 'react';
 import { User, Edit2, Dices, Check, Sparkles, Database, Shield, RefreshCw } from 'lucide-react';
 import { getCurrentUser, updateUserProfile, generateRandomNickname, resetUserProfile } from '../lib/user';
@@ -5811,13 +5811,13 @@ export default function MyPage({ onOpenConfig }) {
   );
 }
 
-`
+```
 
 ---
 
 ## src/pages/GoodItemsPage.jsx
 
-`javascript
+```javascript
 import React, { useState, useEffect } from 'react';
 import { Sparkles, Plus, Image as ImageIcon, Search, Tag, User, Clock, Heart } from 'lucide-react';
 import ShareGoodItemModal from '../components/ShareGoodItemModal';
@@ -6051,13 +6051,13 @@ export default function GoodItemsPage() {
   );
 }
 
-`
+```
 
 ---
 
 ## netlify/functions/sync-data.js
 
-`javascript
+```javascript
 import { getStore } from '@netlify/blobs';
 
 // 初始预置种子审批列表
@@ -6330,7 +6330,30 @@ export default async (req) => {
   try {
     if (req.method === 'GET') {
       const data = await loadAllData();
-      return new Response(JSON.stringify({ success: true, data }), { status: 200, headers });
+
+      // 可选参数 ?limit=N：供 Coze 等第三方插件限制响应体大小。
+      // 不传时保持全量返回，前端广场 / 战绩 / 详情页行为完全不变。
+      let limit = null;
+      try {
+        const raw = new URL(req.url).searchParams.get('limit');
+        if (raw !== null) {
+          const n = parseInt(raw, 10);
+          if (Number.isFinite(n) && n > 0) limit = Math.min(200, n);
+        }
+      } catch {
+        // req.url 异常时退化为全量，不影响原有调用方
+      }
+
+      const payload = limit
+        ? {
+            approvals: data.approvals.slice(0, limit),
+            votes: data.votes.slice(0, limit * 20),
+            comments: data.comments.slice(0, limit * 20),
+            goodItems: data.goodItems.slice(0, limit),
+          }
+        : data;
+
+      return new Response(JSON.stringify({ success: true, data: payload }), { status: 200, headers });
     }
 
     if (req.method === 'POST') {
@@ -6409,14 +6432,13 @@ export default async (req) => {
     return new Response(JSON.stringify({ success: false, error: err.message || 'Server error' }), { status: 500, headers });
   }
 };
-
-`
+```
 
 ---
 
 ## netlify/functions/ai-recommend.js
 
-`javascript
+```javascript
 // Netlify Serverless Function: ai-recommend
 // 统一 AI 建议推理端点：支持多模型 API Key，也具备无 Key 智能语义推演保底
 
@@ -6633,7 +6655,7 @@ function generateSmartRecommendation({ title, price, category, reason, alternati
   return { verdict, reasons: finalReasons };
 }
 
-`
+```
 
 ---
 

@@ -3,7 +3,7 @@
   "info": {
     "title": "省思袋冲动消费审批API",
     "description": "省思袋全网审批流同步、消费数据查询与AI劝退决策插件",
-    "version": "1.0.0"
+    "version": "1.1.0"
   },
   "servers": [
     {
@@ -15,16 +15,31 @@
       "get": {
         "operationId": "getAllApprovalsAndGoodItems",
         "summary": "获取全网最新的消费审批单与好物列表",
-        "description": "拉取省思袋全网当前正在冷静期的单子、已结算胜负战绩以及精选好物库",
+        "description": "拉取省思袋全网当前正在冷静期的单子、已结算胜负战绩以及精选好物库。全量响应体可能超过 1MB，第三方插件平台建议显式传入 limit。",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "返回的审批单与好物条数上限（1–200，建议 20）。不传则返回全量数据；传值时 votes / comments 同步按上限的 20 倍截断，避免响应体过大被平台截断。",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 20
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "成功返回全网数据"
+            "description": "成功返回全网数据，结构为 { success, data: { approvals, votes, comments, goodItems } }"
           }
         }
       },
       "post": {
         "operationId": "createApprovalOrVote",
         "summary": "向全网广播发起一笔新审批或提交表态投票",
+        "description": "字段名必须是 action（不是 type）。取值需与后端一致：create_approval / update_approval / create_vote / create_comment / create_good_item。",
         "requestBody": {
           "required": true,
           "content": {
@@ -32,11 +47,14 @@
               "schema": {
                 "type": "object",
                 "properties": {
-                  "type": {
+                  "action": {
                     "type": "string",
                     "enum": [
                       "create_approval",
-                      "submit_vote"
+                      "update_approval",
+                      "create_vote",
+                      "create_comment",
+                      "create_good_item"
                     ]
                   },
                   "payload": {
@@ -44,7 +62,7 @@
                   }
                 },
                 "required": [
-                  "type",
+                  "action",
                   "payload"
                 ]
               }
